@@ -1,5 +1,19 @@
 const std = @import("std");
 
+fn writerErrorType(comptime WriterType: type) type {
+    return switch (@typeInfo(WriterType)) {
+        .pointer => @typeInfo(WriterType).pointer.child.Error,
+        else => WriterType.Error,
+    };
+}
+
+fn readerErrorType(comptime ReaderType: type) type {
+    return switch (@typeInfo(ReaderType)) {
+        .pointer => @typeInfo(ReaderType).pointer.child.Error,
+        else => ReaderType.Error,
+    };
+}
+
 pub const magic = [4]u8{ 'q', 'o', 'v', 'f' };
 pub const version: u8 = 1;
 
@@ -113,18 +127,18 @@ pub fn chunkTypeByte(chunk_type: ChunkType) u8 {
     return @intFromEnum(chunk_type);
 }
 
-fn readExact(reader: anytype, buf: []u8) (QovError || @TypeOf(reader).Error)!void {
+fn readExact(reader: anytype, buf: []u8) (QovError || readerErrorType(@TypeOf(reader)))!void {
     const amount = try reader.readAll(buf);
     if (amount != buf.len) return QovError.UnexpectedEof;
 }
 
-fn readByteExact(reader: anytype) (QovError || @TypeOf(reader).Error)!u8 {
+fn readByteExact(reader: anytype) (QovError || readerErrorType(@TypeOf(reader)))!u8 {
     var buf: [1]u8 = undefined;
     try readExact(reader, &buf);
     return buf[0];
 }
 
-pub fn readHeader(reader: anytype) (QovError || @TypeOf(reader).Error)!Header {
+pub fn readHeader(reader: anytype) (QovError || readerErrorType(@TypeOf(reader)))!Header {
     var buf: [header_size]u8 = undefined;
     try readExact(reader, &buf);
 
@@ -154,7 +168,7 @@ pub fn readHeader(reader: anytype) (QovError || @TypeOf(reader).Error)!Header {
     return header;
 }
 
-pub fn writeHeader(writer: anytype, header: Header) (QovError || @TypeOf(writer).Error)!void {
+pub fn writeHeader(writer: anytype, header: Header) (QovError || writerErrorType(@TypeOf(writer)))!void {
     try validateHeader(header);
     if (header.audio_sample_rate > 0xFFFFFF) return QovError.InvalidHeader;
 
@@ -180,7 +194,7 @@ pub fn writeHeader(writer: anytype, header: Header) (QovError || @TypeOf(writer)
     try writer.writeAll(&buf);
 }
 
-pub fn readChunkHeader(reader: anytype) (QovError || @TypeOf(reader).Error)!ChunkHeader {
+pub fn readChunkHeader(reader: anytype) (QovError || readerErrorType(@TypeOf(reader)))!ChunkHeader {
     var buf: [chunk_header_size]u8 = undefined;
     try readExact(reader, &buf);
 
@@ -190,22 +204,22 @@ pub fn readChunkHeader(reader: anytype) (QovError || @TypeOf(reader).Error)!Chun
     };
 }
 
-pub fn writeChunkHeader(writer: anytype, header: ChunkHeader) (QovError || @TypeOf(writer).Error)!void {
+pub fn writeChunkHeader(writer: anytype, header: ChunkHeader) (QovError || writerErrorType(@TypeOf(writer)))!void {
     var buf: [chunk_header_size]u8 = undefined;
     buf[0] = chunkTypeByte(header.chunk_type);
     std.mem.writeInt(u32, buf[1..5], header.payload_size, .big);
     try writer.writeAll(&buf);
 }
 
-pub fn readChunkPayload(reader: anytype, payload: []u8) (QovError || @TypeOf(reader).Error)!void {
+pub fn readChunkPayload(reader: anytype, payload: []u8) (QovError || readerErrorType(@TypeOf(reader)))!void {
     try readExact(reader, payload);
 }
 
-pub fn writeChunkPayload(writer: anytype, payload: []const u8) (QovError || @TypeOf(writer).Error)!void {
+pub fn writeChunkPayload(writer: anytype, payload: []const u8) (QovError || writerErrorType(@TypeOf(writer)))!void {
     try writer.writeAll(payload);
 }
 
-pub fn encodeStream(allocator: std.mem.Allocator, writer: anytype, header: Header, frames: []const []const u8) (QovError || std.mem.Allocator.Error || @TypeOf(writer).Error)!void {
+pub fn encodeStream(allocator: std.mem.Allocator, writer: anytype, header: Header, frames: []const []const u8) (QovError || std.mem.Allocator.Error || writerErrorType(@TypeOf(writer)))!void {
     try validateHeader(header);
 
     if (header.frame_count != 0 and header.frame_count != frames.len) return QovError.InvalidHeader;
@@ -229,10 +243,12 @@ pub fn encodeStream(allocator: std.mem.Allocator, writer: anytype, header: Heade
         const use_iframe = index == 0 or gop_size == 0 or (index % gop_size == 0);
 
         if (use_iframe) {
-            try encodeIFrame(payload.writer(allocator), frame);
+            var payload_writer = payload.writer(allocator);
+            try encodeIFrame(&payload_writer, frame);
         } else {
             const prev = prev_pixels orelse return QovError.InvalidChunk;
-            try encodePFrame(payload.writer(allocator), frame, prev);
+            var payload_writer = payload.writer(allocator);
+            try encodePFrame(&payload_writer, frame, prev);
         }
 
         if (payload.items.len > std.math.maxInt(u32)) return QovError.InvalidChunk;
@@ -247,7 +263,7 @@ pub fn encodeStream(allocator: std.mem.Allocator, writer: anytype, header: Heade
     }
 }
 
-pub fn decodeStream(allocator: std.mem.Allocator, reader: anytype, frames: [][]u8) (QovError || std.mem.Allocator.Error || @TypeOf(reader).Error)!Header {
+pub fn decodeStream(allocator: std.mem.Allocator, reader: anytype, frames: [][]u8) (QovError || std.mem.Allocator.Error || readerErrorType(@TypeOf(reader)))!Header {
     const header = try readHeader(reader);
 
     if (header.frame_count != 0 and header.frame_count != frames.len) return QovError.InvalidHeader;
@@ -270,15 +286,16 @@ pub fn decodeStream(allocator: std.mem.Allocator, reader: anytype, frames: [][]u
         try readChunkPayload(reader, payload.items);
 
         var stream = std.io.fixedBufferStream(payload.items);
+        var stream_reader = stream.reader();
 
         switch (chunk_header.chunk_type) {
             .iframe => {
-                try decodeIFrame(stream.reader(), frame);
+                try decodeIFrame(&stream_reader, frame);
                 prev_pixels = frame;
             },
             .pframe => {
                 const prev = prev_pixels orelse return QovError.InvalidChunk;
-                try decodePFrame(stream.reader(), frame, prev);
+                try decodePFrame(&stream_reader, frame, prev);
                 prev_pixels = frame;
             },
             .audio => return QovError.UnsupportedAudio,
@@ -323,7 +340,7 @@ fn writeRgba(pixels: []u8, index: usize, color: Rgba) void {
     pixels[base + 3] = color.a;
 }
 
-pub fn encodeIFrame(writer: anytype, pixels: []const u8) (QovError || @TypeOf(writer).Error)!void {
+pub fn encodeIFrame(writer: anytype, pixels: []const u8) (QovError || writerErrorType(@TypeOf(writer)))!void {
     if (pixels.len % 4 != 0) return QovError.InvalidChunk;
 
     var color_lut = std.mem.zeroes([64]Rgba);
@@ -395,7 +412,7 @@ pub fn encodeIFrame(writer: anytype, pixels: []const u8) (QovError || @TypeOf(wr
     try writer.writeAll(&end_marker);
 }
 
-pub fn decodeIFrame(reader: anytype, pixels: []u8) (QovError || @TypeOf(reader).Error)!void {
+pub fn decodeIFrame(reader: anytype, pixels: []u8) (QovError || readerErrorType(@TypeOf(reader)))!void {
     if (pixels.len % 4 != 0) return QovError.InvalidChunk;
 
     var color_lut = std.mem.zeroes([64]Rgba);
@@ -467,7 +484,7 @@ pub fn decodeIFrame(reader: anytype, pixels: []u8) (QovError || @TypeOf(reader).
     if (!std.mem.eql(u8, &marker, &end_marker)) return QovError.InvalidChunk;
 }
 
-pub fn encodePFrame(writer: anytype, pixels: []const u8, prev_pixels: []const u8) (QovError || @TypeOf(writer).Error)!void {
+pub fn encodePFrame(writer: anytype, pixels: []const u8, prev_pixels: []const u8) (QovError || writerErrorType(@TypeOf(writer)))!void {
     if (pixels.len % 4 != 0) return QovError.InvalidChunk;
     if (pixels.len != prev_pixels.len) return QovError.InvalidChunk;
 
@@ -555,7 +572,7 @@ pub fn encodePFrame(writer: anytype, pixels: []const u8, prev_pixels: []const u8
     try writer.writeAll(&end_marker);
 }
 
-pub fn decodePFrame(reader: anytype, pixels: []u8, prev_pixels: []const u8) (QovError || @TypeOf(reader).Error)!void {
+pub fn decodePFrame(reader: anytype, pixels: []u8, prev_pixels: []const u8) (QovError || readerErrorType(@TypeOf(reader)))!void {
     if (pixels.len % 4 != 0) return QovError.InvalidChunk;
     if (pixels.len != prev_pixels.len) return QovError.InvalidChunk;
 
@@ -769,10 +786,12 @@ test "header read/write roundtrip" {
 
     var buffer: [header_size]u8 = undefined;
     var stream = std.io.fixedBufferStream(&buffer);
-    try writeHeader(stream.writer(), header);
+    var stream_writer = stream.writer();
+    try writeHeader(&stream_writer, header);
 
     stream.pos = 0;
-    const decoded = try readHeader(stream.reader());
+    var stream_reader = stream.reader();
+    const decoded = try readHeader(&stream_reader);
 
     try std.testing.expectEqual(header.width, decoded.width);
     try std.testing.expectEqual(header.height, decoded.height);
@@ -796,14 +815,16 @@ test "chunk header and payload read/write roundtrip" {
 
     var buffer: [chunk_header_size + payload.len]u8 = undefined;
     var stream = std.io.fixedBufferStream(&buffer);
-    try writeChunkHeader(stream.writer(), header);
-    try writeChunkPayload(stream.writer(), payload);
+    var stream_writer = stream.writer();
+    try writeChunkHeader(&stream_writer, header);
+    try writeChunkPayload(&stream_writer, payload);
 
     stream.pos = 0;
-    const decoded_header = try readChunkHeader(stream.reader());
+    var stream_reader = stream.reader();
+    const decoded_header = try readChunkHeader(&stream_reader);
 
     var decoded_payload: [payload.len]u8 = undefined;
-    try readChunkPayload(stream.reader(), &decoded_payload);
+    try readChunkPayload(&stream_reader, &decoded_payload);
 
     try std.testing.expectEqual(header.chunk_type, decoded_header.chunk_type);
     try std.testing.expectEqual(header.payload_size, decoded_header.payload_size);
@@ -822,11 +843,13 @@ test "I-frame encode/decode roundtrip" {
     var encoded = std.ArrayList(u8).empty;
     defer encoded.deinit(std.testing.allocator);
 
-    try encodeIFrame(encoded.writer(std.testing.allocator), &pixels);
+    var encoded_writer = encoded.writer(std.testing.allocator);
+    try encodeIFrame(&encoded_writer, &pixels);
 
     var decoded: [pixels.len]u8 = undefined;
     var stream = std.io.fixedBufferStream(encoded.items);
-    try decodeIFrame(stream.reader(), &decoded);
+    var stream_reader = stream.reader();
+    try decodeIFrame(&stream_reader, &decoded);
 
     try std.testing.expectEqualSlices(u8, &pixels, &decoded);
     try std.testing.expectEqual(encoded.items.len, stream.pos);
@@ -850,11 +873,13 @@ test "P-frame encode/decode roundtrip with temporal ops" {
     var encoded = std.ArrayList(u8).empty;
     defer encoded.deinit(std.testing.allocator);
 
-    try encodePFrame(encoded.writer(std.testing.allocator), &pixels, &prev_pixels);
+    var encoded_writer = encoded.writer(std.testing.allocator);
+    try encodePFrame(&encoded_writer, &pixels, &prev_pixels);
 
     var decoded: [pixels.len]u8 = undefined;
     var stream = std.io.fixedBufferStream(encoded.items);
-    try decodePFrame(stream.reader(), &decoded, &prev_pixels);
+    var stream_reader = stream.reader();
+    try decodePFrame(&stream_reader, &decoded, &prev_pixels);
 
     try std.testing.expectEqualSlices(u8, &pixels, &decoded);
     try std.testing.expectEqual(encoded.items.len, stream.pos);
@@ -896,14 +921,16 @@ test "stream encode/decode roundtrip" {
     var encoded = std.ArrayList(u8).empty;
     defer encoded.deinit(std.testing.allocator);
 
-    try encodeStream(std.testing.allocator, encoded.writer(std.testing.allocator), header, &frames);
+    var encoded_writer = encoded.writer(std.testing.allocator);
+    try encodeStream(std.testing.allocator, &encoded_writer, header, &frames);
 
     var out0: [frame0.len]u8 = undefined;
     var out1: [frame1.len]u8 = undefined;
     var out_frames = [_][]u8{ &out0, &out1 };
 
     var stream = std.io.fixedBufferStream(encoded.items);
-    const decoded_header = try decodeStream(std.testing.allocator, stream.reader(), &out_frames);
+    var stream_reader = stream.reader();
+    const decoded_header = try decodeStream(std.testing.allocator, &stream_reader, &out_frames);
 
     try std.testing.expectEqual(header.width, decoded_header.width);
     try std.testing.expectEqual(header.height, decoded_header.height);

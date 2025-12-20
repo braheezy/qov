@@ -52,8 +52,10 @@ pub fn main() !void {
 }
 
 fn printUsage() !void {
-    const err = std.io.getStdErr().writer();
-    try err.writeAll(
+    var stderr_buf: [256]u8 = undefined;
+    var err = std.fs.File.stderr().writer(&stderr_buf);
+    defer err.interface.flush() catch {};
+    try err.interface.writeAll(
         "Usage:\n" ++
             "  qov encode <output.qov> <input1.qoi> [input2.qoi ...]\n" ++
             "  qov decode <input.qov> <output_dir>\n",
@@ -109,7 +111,10 @@ fn runEncode(allocator: std.mem.Allocator, output_path: []const u8, input_paths:
     var out_file = try std.fs.cwd().createFile(output_path, .{ .truncate = true });
     defer out_file.close();
 
-    try qov.encodeStream(allocator, out_file.writer(), header, frames.items);
+    var out_buf: [8192]u8 = undefined;
+    var out_writer = out_file.writer(&out_buf);
+    try qov.encodeStream(allocator, &out_writer.interface, header, frames.items);
+    try out_writer.interface.flush();
 }
 
 fn runDecode(allocator: std.mem.Allocator, input_path: []const u8, output_dir: []const u8) !void {
@@ -117,7 +122,8 @@ fn runDecode(allocator: std.mem.Allocator, input_path: []const u8, output_dir: [
     defer allocator.free(file_bytes);
 
     var stream = std.io.fixedBufferStream(file_bytes);
-    const header = try qov.readHeader(stream.reader());
+    var stream_reader = stream.reader();
+    const header = try qov.readHeader(&stream_reader);
 
     if (header.frame_count == 0) return CliError.StreamingNotSupported;
 
@@ -135,7 +141,8 @@ fn runDecode(allocator: std.mem.Allocator, input_path: []const u8, output_dir: [
     }
 
     stream.pos = 0;
-    _ = try qov.decodeStream(allocator, stream.reader(), frames);
+    stream_reader = stream.reader();
+    _ = try qov.decodeStream(allocator, &stream_reader, frames);
 
     try std.fs.cwd().makePath(output_dir);
 
@@ -146,13 +153,17 @@ fn runDecode(allocator: std.mem.Allocator, input_path: []const u8, output_dir: [
         var out_file = try std.fs.cwd().createFile(filename, .{ .truncate = true });
         defer out_file.close();
 
-        try writeQoi(out_file.writer(), header.width, header.height, frame);
+        var out_buf: [4096]u8 = undefined;
+        var out_writer = out_file.writer(&out_buf);
+        try writeQoi(&out_writer.interface, header.width, header.height, frame);
+        try out_writer.interface.flush();
     }
 }
 
 fn decodeQoiToRgba(allocator: std.mem.Allocator, file_bytes: []const u8) !struct { header: QoiHeader, pixels: []u8 } {
     var stream = std.io.fixedBufferStream(file_bytes);
-    const header = try readQoiHeader(stream.reader());
+    var stream_reader = stream.reader();
+    const header = try readQoiHeader(&stream_reader);
 
     if (header.channels != 3 and header.channels != 4) return CliError.UnsupportedQoi;
     if (header.width == 0 or header.height == 0) return CliError.InvalidQoi;
@@ -163,7 +174,7 @@ fn decodeQoiToRgba(allocator: std.mem.Allocator, file_bytes: []const u8) !struct
     const pixels = try allocator.alloc(u8, pixel_bytes);
     errdefer allocator.free(pixels);
 
-    try qov.decodeIFrame(stream.reader(), pixels);
+    try qov.decodeIFrame(&stream_reader, pixels);
 
     return .{ .header = header, .pixels = pixels };
 }
@@ -224,7 +235,8 @@ test "qoi read/write roundtrip" {
     var buffer = std.ArrayList(u8).empty;
     defer buffer.deinit(allocator);
 
-    try writeQoi(buffer.writer(allocator), 2, 1, &pixels);
+    var buffer_writer = buffer.writer(allocator);
+    try writeQoi(&buffer_writer, 2, 1, &pixels);
 
     const decoded = try decodeQoiToRgba(allocator, buffer.items);
     defer allocator.free(decoded.pixels);

@@ -36,7 +36,8 @@ fn loadQoiRgba(allocator: std.mem.Allocator, path: []const u8) !struct { header:
     defer allocator.free(file_bytes);
 
     var stream = std.io.fixedBufferStream(file_bytes);
-    const header = try readQoiHeader(stream.reader());
+    var stream_reader = stream.reader();
+    const header = try readQoiHeader(&stream_reader);
 
     if (header.channels != 4) return QoiError.InvalidQoi;
     if (header.width == 0 or header.height == 0) return QoiError.InvalidQoi;
@@ -47,7 +48,7 @@ fn loadQoiRgba(allocator: std.mem.Allocator, path: []const u8) !struct { header:
     const pixels = try allocator.alloc(u8, pixel_bytes);
     errdefer allocator.free(pixels);
 
-    try qov.decodeIFrame(stream.reader(), pixels);
+    try qov.decodeIFrame(&stream_reader, pixels);
 
     return .{ .header = header, .pixels = pixels };
 }
@@ -103,7 +104,8 @@ test "qoi vector stream roundtrip" {
     var encoded = std.ArrayList(u8).empty;
     defer encoded.deinit(allocator);
 
-    try qov.encodeStream(allocator, encoded.writer(allocator), header, frames.items);
+    var encoded_writer = encoded.writer(allocator);
+    try qov.encodeStream(allocator, &encoded_writer, header, frames.items);
 
     const out_frames = try allocator.alloc([]u8, frames.items.len);
     defer {
@@ -117,7 +119,8 @@ test "qoi vector stream roundtrip" {
     }
 
     var stream = std.io.fixedBufferStream(encoded.items);
-    const decoded_header = try qov.decodeStream(allocator, stream.reader(), out_frames);
+    var stream_reader = stream.reader();
+    const decoded_header = try qov.decodeStream(allocator, &stream_reader, out_frames);
 
     try std.testing.expectEqual(header.width, decoded_header.width);
     try std.testing.expectEqual(header.height, decoded_header.height);
