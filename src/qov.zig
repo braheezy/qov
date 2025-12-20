@@ -912,3 +912,7 @@ test "stream encode/decode roundtrip" {
     try std.testing.expectEqualSlices(u8, &frame1, out_frames[1]);
     try std.testing.expectEqual(encoded.items.len, stream.pos);
 }
+
+test {
+    _ = @import("qov_test.zig");
+}

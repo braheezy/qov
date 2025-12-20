@@ -11,6 +11,6 @@ This phase establishes the core QOV data model, streaming encode/decode APIs, an
 - [x] Add `encodeStream` and `decodeStream` APIs in `src/qov.zig` that take a reader/writer and operate on in-memory RGBA8 frame buffers. (Implemented chunked stream helpers plus a roundtrip test.)
 - [x] Create `src/cli.zig` with `qov encode` (list of input .qoi paths -> .qov output) and `qov decode` (.qov -> output directory of .qoi files). (Implemented CLI with minimal QOI read/write and QOV encode/decode.)
 - [x] Wire CLI into `build.zig` with `zig build run` support and install step.
-- [ ] Add `src/qov_test.zig` with a 3-frame RGBA8 vector test: load 3 QOI files, encode to QOV in-memory, decode, and byte-compare RGBA outputs.
+- [x] Add `src/qov_test.zig` with a 3-frame RGBA8 vector test: load 3 QOI files, encode to QOV in-memory, decode, and byte-compare RGBA outputs. (Added `src/qov_test.zig` plus `testdata/qoi` fixtures.)
 - [ ] Add a golden roundtrip CLI test script (or a Zig test) that encodes then decodes and verifies identical QOI output files.
 - [ ] Verify: `zig build test` passes and `zig build run -- encode ...` then `decode ...` produces matching frames.
