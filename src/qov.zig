@@ -205,6 +205,91 @@ pub fn writeChunkPayload(writer: anytype, payload: []const u8) (QovError || @Typ
     try writer.writeAll(payload);
 }
 
+pub fn encodeStream(allocator: std.mem.Allocator, writer: anytype, header: Header, frames: []const []const u8) (QovError || std.mem.Allocator.Error || @TypeOf(writer).Error)!void {
+    try validateHeader(header);
+
+    if (header.frame_count != 0 and header.frame_count != frames.len) return QovError.InvalidHeader;
+
+    const expected_bytes = headerFrameBytes(header);
+    for (frames) |frame| {
+        if (frame.len != expected_bytes) return QovError.InvalidChunk;
+    }
+
+    try writeHeader(writer, header);
+
+    var payload = std.ArrayList(u8).empty;
+    defer payload.deinit(allocator);
+
+    var prev_pixels: ?[]const u8 = null;
+    const gop_size = header.gop_size;
+
+    for (frames, 0..) |frame, index| {
+        payload.clearRetainingCapacity();
+
+        const use_iframe = index == 0 or gop_size == 0 or (index % gop_size == 0);
+
+        if (use_iframe) {
+            try encodeIFrame(payload.writer(allocator), frame);
+        } else {
+            const prev = prev_pixels orelse return QovError.InvalidChunk;
+            try encodePFrame(payload.writer(allocator), frame, prev);
+        }
+
+        if (payload.items.len > std.math.maxInt(u32)) return QovError.InvalidChunk;
+
+        try writeChunkHeader(writer, .{
+            .chunk_type = if (use_iframe) .iframe else .pframe,
+            .payload_size = @intCast(payload.items.len),
+        });
+        try writeChunkPayload(writer, payload.items);
+
+        prev_pixels = frame;
+    }
+}
+
+pub fn decodeStream(allocator: std.mem.Allocator, reader: anytype, frames: [][]u8) (QovError || std.mem.Allocator.Error || @TypeOf(reader).Error)!Header {
+    const header = try readHeader(reader);
+
+    if (header.frame_count != 0 and header.frame_count != frames.len) return QovError.InvalidHeader;
+
+    const expected_bytes = headerFrameBytes(header);
+    for (frames) |frame| {
+        if (frame.len != expected_bytes) return QovError.InvalidChunk;
+    }
+
+    var payload = std.ArrayList(u8).empty;
+    defer payload.deinit(allocator);
+
+    var prev_pixels: ?[]u8 = null;
+
+    for (frames) |frame| {
+        const chunk_header = try readChunkHeader(reader);
+        const payload_size: usize = @intCast(chunk_header.payload_size);
+
+        try payload.resize(allocator, payload_size);
+        try readChunkPayload(reader, payload.items);
+
+        var stream = std.io.fixedBufferStream(payload.items);
+
+        switch (chunk_header.chunk_type) {
+            .iframe => {
+                try decodeIFrame(stream.reader(), frame);
+                prev_pixels = frame;
+            },
+            .pframe => {
+                const prev = prev_pixels orelse return QovError.InvalidChunk;
+                try decodePFrame(stream.reader(), frame, prev);
+                prev_pixels = frame;
+            },
+            .audio => return QovError.UnsupportedAudio,
+        }
+
+        if (stream.pos != payload.items.len) return QovError.InvalidChunk;
+    }
+
+    return header;
+}
+
 const Rgba = struct {
     r: u8,
     g: u8,
@@ -775,4 +860,55 @@ test "P-frame encode/decode roundtrip with temporal ops" {
     try std.testing.expectEqual(encoded.items.len, stream.pos);
     try std.testing.expect(std.mem.indexOfScalar(u8, encoded.items, 0xFC) != null);
     try std.testing.expect(std.mem.indexOfScalar(u8, encoded.items, 0xFD) != null);
+}
+
+test "stream encode/decode roundtrip" {
+    const header = Header{
+        .width = 2,
+        .height = 2,
+        .fps_num = 30,
+        .fps_den = 1,
+        .colorspace = .srgb,
+        .channels = .rgba,
+        .gop_size = 2,
+        .has_audio = false,
+        .audio_sample_rate = 0,
+        .audio_channels = 0,
+        .frame_count = 2,
+    };
+
+    const frame0 = [_]u8{
+        10, 20, 30, 255,
+        10, 20, 30, 255,
+        40, 50, 60, 255,
+        70, 80, 90, 255,
+    };
+
+    const frame1 = [_]u8{
+        10, 20, 30, 255,
+        10, 20, 30, 255,
+        41, 51, 61, 255,
+        70, 80, 90, 255,
+    };
+
+    const frames = [_][]const u8{ &frame0, &frame1 };
+
+    var encoded = std.ArrayList(u8).empty;
+    defer encoded.deinit(std.testing.allocator);
+
+    try encodeStream(std.testing.allocator, encoded.writer(std.testing.allocator), header, &frames);
+
+    var out0: [frame0.len]u8 = undefined;
+    var out1: [frame1.len]u8 = undefined;
+    var out_frames = [_][]u8{ &out0, &out1 };
+
+    var stream = std.io.fixedBufferStream(encoded.items);
+    const decoded_header = try decodeStream(std.testing.allocator, stream.reader(), &out_frames);
+
+    try std.testing.expectEqual(header.width, decoded_header.width);
+    try std.testing.expectEqual(header.height, decoded_header.height);
+    try std.testing.expectEqual(header.frame_count, decoded_header.frame_count);
+    try std.testing.expectEqualSlices(u8, &frame0, out_frames[0]);
+    try std.testing.expectEqualSlices(u8, &frame1, out_frames[1]);
+    try std.testing.expectEqual(encoded.items.len, stream.pos);
 }
