@@ -382,6 +382,228 @@ pub fn decodeIFrame(reader: anytype, pixels: []u8) (QovError || @TypeOf(reader).
     if (!std.mem.eql(u8, &marker, &end_marker)) return QovError.InvalidChunk;
 }
 
+pub fn encodePFrame(writer: anytype, pixels: []const u8, prev_pixels: []const u8) (QovError || @TypeOf(writer).Error)!void {
+    if (pixels.len % 4 != 0) return QovError.InvalidChunk;
+    if (pixels.len != prev_pixels.len) return QovError.InvalidChunk;
+
+    var color_lut = std.mem.zeroes([64]Rgba);
+    var prev_pixel = Rgba{ .r = 0, .g = 0, .b = 0, .a = 0xFF };
+    var trun_length: usize = 0;
+
+    const pixel_count = pixels.len / 4;
+    for (0..pixel_count) |i| {
+        const pixel = rgbaFromSlice(pixels, i);
+        const temporal = rgbaFromSlice(prev_pixels, i);
+        const same_temporal = pixel.eql(temporal);
+
+        if (!same_temporal and trun_length > 0) {
+            try writer.writeAll(&[2]u8{ 0xFC, @as(u8, @truncate(trun_length - 1)) });
+            trun_length = 0;
+        }
+
+        if (same_temporal) {
+            trun_length += 1;
+            color_lut[pixel.hash()] = pixel;
+            prev_pixel = pixel;
+
+            if (trun_length == 256) {
+                try writer.writeAll(&[2]u8{ 0xFC, 0xFF });
+                trun_length = 0;
+            }
+            continue;
+        }
+
+        if (encodeTdiff(pixel, temporal)) |tdiff_byte| {
+            try writer.writeAll(&[2]u8{ 0xFD, tdiff_byte });
+        } else {
+            const hash = pixel.hash();
+            if (color_lut[hash].eql(pixel)) {
+                try writer.writeByte(0b0000_0000 | hash);
+            } else {
+                color_lut[hash] = pixel;
+
+                const diff_r = @as(i16, pixel.r) - @as(i16, prev_pixel.r);
+                const diff_g = @as(i16, pixel.g) - @as(i16, prev_pixel.g);
+                const diff_b = @as(i16, pixel.b) - @as(i16, prev_pixel.b);
+                const diff_a = @as(i16, pixel.a) - @as(i16, prev_pixel.a);
+
+                const diff_rg = diff_r - diff_g;
+                const diff_rb = diff_b - diff_g;
+
+                if (diff_a == 0 and inRange2(diff_r) and inRange2(diff_g) and inRange2(diff_b)) {
+                    const byte = 0b0100_0000 |
+                        (mapRange2(diff_r) << 4) |
+                        (mapRange2(diff_g) << 2) |
+                        (mapRange2(diff_b) << 0);
+                    try writer.writeByte(byte);
+                } else if (diff_a == 0 and inRange6(diff_g) and inRange4(diff_rg) and inRange4(diff_rb)) {
+                    try writer.writeAll(&[2]u8{
+                        0b1000_0000 | mapRange6(diff_g),
+                        (mapRange4(diff_rg) << 4) | (mapRange4(diff_rb) << 0),
+                    });
+                } else if (diff_a == 0) {
+                    try writer.writeAll(&[4]u8{
+                        0b1111_1110,
+                        pixel.r,
+                        pixel.g,
+                        pixel.b,
+                    });
+                } else {
+                    try writer.writeAll(&[5]u8{
+                        0b1111_1111,
+                        pixel.r,
+                        pixel.g,
+                        pixel.b,
+                        pixel.a,
+                    });
+                }
+            }
+        }
+
+        prev_pixel = pixel;
+    }
+
+    if (trun_length > 0) {
+        try writer.writeAll(&[2]u8{ 0xFC, @as(u8, @truncate(trun_length - 1)) });
+    }
+
+    try writer.writeAll(&end_marker);
+}
+
+pub fn decodePFrame(reader: anytype, pixels: []u8, prev_pixels: []const u8) (QovError || @TypeOf(reader).Error)!void {
+    if (pixels.len % 4 != 0) return QovError.InvalidChunk;
+    if (pixels.len != prev_pixels.len) return QovError.InvalidChunk;
+
+    var color_lut = std.mem.zeroes([64]Rgba);
+    var prev_pixel = Rgba{ .r = 0, .g = 0, .b = 0, .a = 0xFF };
+
+    const pixel_count = pixels.len / 4;
+    var index: usize = 0;
+
+    while (index < pixel_count) {
+        const byte = try readByteExact(reader);
+
+        if (byte == 0xFC) {
+            const count = @as(usize, try readByteExact(reader)) + 1;
+            if (index + count > pixel_count) return QovError.InvalidChunk;
+
+            var remaining = count;
+            while (remaining > 0) {
+                remaining -= 1;
+                const temporal = rgbaFromSlice(prev_pixels, index);
+                writeRgba(pixels, index, temporal);
+                color_lut[temporal.hash()] = temporal;
+                prev_pixel = temporal;
+                index += 1;
+            }
+            continue;
+        }
+
+        if (byte == 0xFD) {
+            const diff_byte = try readByteExact(reader);
+            if ((diff_byte & 0x1) != 0) return QovError.InvalidChunk;
+
+            var new_pixel = rgbaFromSlice(prev_pixels, index);
+            const sign = diff_byte >> 7;
+            const diff_r = if (sign == 0) @as(i8, @intCast((diff_byte >> 5) & 0x3)) else -@as(i8, @intCast((diff_byte >> 5) & 0x3));
+            const diff_g = if (sign == 0) @as(i8, @intCast((diff_byte >> 3) & 0x3)) else -@as(i8, @intCast((diff_byte >> 3) & 0x3));
+            const diff_b = if (sign == 0) @as(i8, @intCast((diff_byte >> 1) & 0x3)) else -@as(i8, @intCast((diff_byte >> 1) & 0x3));
+
+            add8(&new_pixel.r, diff_r);
+            add8(&new_pixel.g, diff_g);
+            add8(&new_pixel.b, diff_b);
+
+            writeRgba(pixels, index, new_pixel);
+            index += 1;
+            color_lut[new_pixel.hash()] = new_pixel;
+            prev_pixel = new_pixel;
+            continue;
+        }
+
+        var new_pixel = prev_pixel;
+        var count: usize = 1;
+
+        if (byte == 0b1111_1110) {
+            new_pixel.r = try readByteExact(reader);
+            new_pixel.g = try readByteExact(reader);
+            new_pixel.b = try readByteExact(reader);
+        } else if (byte == 0b1111_1111) {
+            new_pixel.r = try readByteExact(reader);
+            new_pixel.g = try readByteExact(reader);
+            new_pixel.b = try readByteExact(reader);
+            new_pixel.a = try readByteExact(reader);
+        } else if (hasPrefix(byte, u2, 0b00)) {
+            const color_index: u6 = @truncate(byte);
+            new_pixel = color_lut[color_index];
+        } else if (hasPrefix(byte, u2, 0b01)) {
+            const diff_r = unmapRange2(byte >> 4);
+            const diff_g = unmapRange2(byte >> 2);
+            const diff_b = unmapRange2(byte >> 0);
+
+            add8(&new_pixel.r, diff_r);
+            add8(&new_pixel.g, diff_g);
+            add8(&new_pixel.b, diff_b);
+        } else if (hasPrefix(byte, u2, 0b10)) {
+            const diff_g = unmapRange6(byte);
+            const diff_rg_rb = try readByteExact(reader);
+
+            const diff_rg = unmapRange4(diff_rg_rb >> 4);
+            const diff_rb = unmapRange4(diff_rg_rb >> 0);
+
+            const diff_r = @as(i8, diff_g) + diff_rg;
+            const diff_b = @as(i8, diff_g) + diff_rb;
+
+            add8(&new_pixel.r, diff_r);
+            add8(&new_pixel.g, diff_g);
+            add8(&new_pixel.b, diff_b);
+        } else if (hasPrefix(byte, u2, 0b11)) {
+            count = @as(usize, @as(u6, @truncate(byte))) + 1;
+            if (count > 62) return QovError.InvalidChunk;
+        } else {
+            return QovError.InvalidChunk;
+        }
+
+        if (index + count > pixel_count) return QovError.InvalidChunk;
+
+        while (count > 0) {
+            count -= 1;
+            writeRgba(pixels, index, new_pixel);
+            index += 1;
+        }
+
+        color_lut[new_pixel.hash()] = new_pixel;
+        prev_pixel = new_pixel;
+    }
+
+    var marker: [end_marker.len]u8 = undefined;
+    try readExact(reader, &marker);
+    if (!std.mem.eql(u8, &marker, &end_marker)) return QovError.InvalidChunk;
+}
+
+fn encodeTdiff(pixel: Rgba, temporal: Rgba) ?u8 {
+    if (pixel.a != temporal.a) return null;
+
+    const diff_r = @as(i16, pixel.r) - @as(i16, temporal.r);
+    const diff_g = @as(i16, pixel.g) - @as(i16, temporal.g);
+    const diff_b = @as(i16, pixel.b) - @as(i16, temporal.b);
+
+    if (diff_r >= 0 and diff_g >= 0 and diff_b >= 0 and diff_r <= 3 and diff_g <= 3 and diff_b <= 3) {
+        return (@as(u8, 0) << 7) |
+            (@as(u8, @intCast(diff_r)) << 5) |
+            (@as(u8, @intCast(diff_g)) << 3) |
+            (@as(u8, @intCast(diff_b)) << 1);
+    }
+
+    if (diff_r <= 0 and diff_g <= 0 and diff_b <= 0 and diff_r >= -3 and diff_g >= -3 and diff_b >= -3) {
+        return (@as(u8, 1) << 7) |
+            (@as(u8, @intCast(-diff_r)) << 5) |
+            (@as(u8, @intCast(-diff_g)) << 3) |
+            (@as(u8, @intCast(-diff_b)) << 1);
+    }
+
+    return null;
+}
+
 fn mapRange2(val: i16) u8 {
     return @as(u2, @intCast(val + 2));
 }
@@ -523,4 +745,34 @@ test "I-frame encode/decode roundtrip" {
 
     try std.testing.expectEqualSlices(u8, &pixels, &decoded);
     try std.testing.expectEqual(encoded.items.len, stream.pos);
+}
+
+test "P-frame encode/decode roundtrip with temporal ops" {
+    const prev_pixels = [_]u8{
+        10, 20, 30, 255,
+        10, 20, 30, 255,
+        5, 5, 5, 255,
+        8, 9, 10, 255,
+    };
+
+    const pixels = [_]u8{
+        10, 20, 30, 255,
+        10, 20, 30, 255,
+        7, 7, 7, 255,
+        30, 40, 50, 254,
+    };
+
+    var encoded = std.ArrayList(u8).empty;
+    defer encoded.deinit(std.testing.allocator);
+
+    try encodePFrame(encoded.writer(std.testing.allocator), &pixels, &prev_pixels);
+
+    var decoded: [pixels.len]u8 = undefined;
+    var stream = std.io.fixedBufferStream(encoded.items);
+    try decodePFrame(stream.reader(), &decoded, &prev_pixels);
+
+    try std.testing.expectEqualSlices(u8, &pixels, &decoded);
+    try std.testing.expectEqual(encoded.items.len, stream.pos);
+    try std.testing.expect(std.mem.indexOfScalar(u8, encoded.items, 0xFC) != null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, encoded.items, 0xFD) != null);
 }
