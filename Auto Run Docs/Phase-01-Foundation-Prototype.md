@@ -5,7 +5,7 @@ This phase establishes the core QOV data model, streaming encode/decode APIs, an
 ## Tasks
 
 - [x] Create `src/qov.zig` with QOV constants, header/chunk structs, and error set (RGBA8 fixed-size frames only).
-- [ ] Implement streaming IO helpers in `src/qov.zig` using Zig’s reader/writer interfaces (read/write header, read/write chunk header + payload).
+- [x] Implement streaming IO helpers in `src/qov.zig` using Zig’s reader/writer interfaces (read/write header, read/write chunk header + payload).
 - [ ] Implement I-frame encode/decode in `src/qov.zig` using QOI-style ops and end marker handling.
 - [ ] Implement P-frame encode/decode in `src/qov.zig` with temporal ops (TRUN/TDIFF) plus spatial fallback ops.
 - [ ] Add `encodeStream` and `decodeStream` APIs in `src/qov.zig` that take a reader/writer and operate on in-memory RGBA8 frame buffers.
