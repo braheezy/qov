@@ -64,6 +64,7 @@ pub const QovError = error{
     UnsupportedAudio,
     InvalidHeader,
     InvalidChunk,
+    FrameSizeMismatch,
     UnexpectedEof,
 };
 
@@ -226,7 +227,7 @@ pub fn encodeStream(allocator: std.mem.Allocator, writer: anytype, header: Heade
 
     const expected_bytes = headerFrameBytes(header);
     for (frames) |frame| {
-        if (frame.len != expected_bytes) return QovError.InvalidChunk;
+        if (frame.len != expected_bytes) return QovError.FrameSizeMismatch;
     }
 
     try writeHeader(writer, header);
@@ -290,7 +291,7 @@ pub fn StreamDecoder(comptime ReaderType: type) type {
 
         pub fn nextFrame(self: *@This(), frame: []u8) (QovError || std.mem.Allocator.Error || readerErrorType(ReaderType))!bool {
             const expected_bytes = headerFrameBytes(self.header);
-            if (frame.len != expected_bytes) return QovError.InvalidChunk;
+            if (frame.len != expected_bytes) return QovError.FrameSizeMismatch;
 
             if (self.header.frame_count != 0 and self.frame_index >= self.header.frame_count) return false;
 
@@ -975,6 +976,56 @@ test "stream encode/decode roundtrip" {
     try std.testing.expectEqualSlices(u8, &frame0, out_frames[0]);
     try std.testing.expectEqualSlices(u8, &frame1, out_frames[1]);
     try std.testing.expectEqual(encoded.items.len, stream.pos);
+}
+
+test "stream rejects frame size mismatches" {
+    const header = Header{
+        .width = 2,
+        .height = 2,
+        .fps_num = 30,
+        .fps_den = 1,
+        .colorspace = .srgb,
+        .channels = .rgba,
+        .gop_size = 1,
+        .has_audio = false,
+        .audio_sample_rate = 0,
+        .audio_channels = 0,
+        .frame_count = 1,
+    };
+
+    const frame = [_]u8{
+        1, 2, 3, 255,
+        4, 5, 6, 255,
+        7, 8, 9, 255,
+        10, 11, 12, 255,
+    };
+
+    const bad_frame = [_]u8{
+        1, 2, 3, 255,
+        4, 5, 6, 255,
+        7, 8, 9, 255,
+    };
+
+    const frames = [_][]const u8{ &bad_frame };
+
+    var encoded = std.ArrayList(u8).empty;
+    defer encoded.deinit(std.testing.allocator);
+
+    var encoded_writer = encoded.writer(std.testing.allocator);
+    try std.testing.expectError(QovError.FrameSizeMismatch, encodeStream(std.testing.allocator, &encoded_writer, header, &frames));
+
+    var buffer: [header_size]u8 = undefined;
+    var header_stream = std.io.fixedBufferStream(&buffer);
+    var header_writer = header_stream.writer();
+    try writeHeader(&header_writer, header);
+
+    header_stream.pos = 0;
+    var header_reader = header_stream.reader();
+    var decoder = try StreamDecoder(@TypeOf(&header_reader)).init(std.testing.allocator, &header_reader);
+    defer decoder.deinit();
+
+    var out: [frame.len]u8 = undefined;
+    try std.testing.expectError(QovError.FrameSizeMismatch, decoder.nextFrame(out[0..bad_frame.len]));
 }
 
 test "stream decoder nextFrame helper" {

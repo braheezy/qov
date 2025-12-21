@@ -6,7 +6,8 @@ This phase tightens streaming ergonomics, improves error handling, and expands t
 
 - [x] Add explicit streaming frame iteration helpers (e.g., `nextFrame()` decoder state machine) in `src/qov.zig`.
   - Added `StreamDecoder` with `nextFrame` and refactored `decodeStream` to use it; covered by a new helper test in `src/qov.zig`.
-- [ ] Validate and enforce fixed width/height across frames with clear error messages.
+- [x] Validate and enforce fixed width/height across frames with clear error messages.
+  - Added a dedicated `FrameSizeMismatch` error surfaced by stream encode/decode checks and covered by a new stream mismatch test.
 - [ ] Add tests for RUN/TRUN boundary lengths, chunk payload sizing, and end marker detection in `src/qov_test.zig`.
 - [ ] Add negative tests for malformed headers, unknown chunk types, and truncated streams.
 - [ ] Add frame-count streaming behavior: support `frame_count = 0` (unknown) and ensure decode ends on EOF.
