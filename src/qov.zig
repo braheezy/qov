@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 fn writerErrorType(comptime WriterType: type) type {
     return switch (@typeInfo(WriterType)) {
@@ -59,6 +60,11 @@ pub const Header = struct {
     audio_sample_rate: u32,
     audio_channels: u8,
     frame_count: u32,
+};
+
+pub const EncodeOptions = struct {
+    parallel: bool = false,
+    max_threads: ?usize = null,
 };
 
 pub const ChunkHeader = struct {
@@ -255,25 +261,93 @@ pub fn writeChunkPayload(writer: anytype, payload: []const u8) (QovError || writ
     try writer.writeAll(payload);
 }
 
-pub fn encodeStream(allocator: std.mem.Allocator, writer: anytype, header: Header, frames: []const []const u8, frame_durations_us: ?[]const u32) (QovError || std.mem.Allocator.Error || writerErrorType(@TypeOf(writer)))!void {
-    try validateHeader(header);
+fn maxFramePayloadBytes(header: Header) usize {
+    const pixel_count = headerFramePixels(header);
+    return pixel_count * 5 + end_marker.len;
+}
 
-    if (header.frame_count != 0 and header.frame_count != frames.len) return QovError.InvalidHeader;
-    if (header.flags.frame_metadata) {
-        if (frame_durations_us) |durations| {
-            if (durations.len != frames.len) return QovError.InvalidHeader;
+const EncodeJobContext = struct {
+    frames: []const []const u8,
+    rgba_frames: ?[][]u8,
+    use_iframes: []const bool,
+    payload_buffers: [][]u8,
+    payload_sizes: []usize,
+    has_error: *std.atomic.Value(bool),
+    err_mutex: *std.Thread.Mutex,
+    stored_err: *?QovError,
+    rgb_only: bool,
+};
+
+fn recordEncodeError(ctx: *EncodeJobContext, err: QovError) void {
+    ctx.has_error.store(true, .seq_cst);
+    ctx.err_mutex.lock();
+    defer ctx.err_mutex.unlock();
+    if (ctx.stored_err.* == null) {
+        ctx.stored_err.* = err;
+    }
+}
+
+fn encodeFrameJob(ctx: *EncodeJobContext, index: usize) void {
+    if (ctx.has_error.load(.seq_cst)) return;
+
+    const use_iframe = ctx.use_iframes[index];
+    var stream = std.io.fixedBufferStream(ctx.payload_buffers[index]);
+    var stream_writer = stream.writer();
+
+    if (ctx.rgb_only) {
+        const rgba_frames = ctx.rgba_frames orelse {
+            recordEncodeError(ctx, QovError.InvalidChunk);
+            return;
+        };
+        const curr = rgba_frames[index];
+        if (use_iframe) {
+            encodeIFrame(&stream_writer, curr) catch |err| {
+                if (err == error.NoSpaceLeft) {
+                    recordEncodeError(ctx, QovError.InvalidChunk);
+                } else {
+                    recordEncodeError(ctx, @errorCast(err));
+                }
+                return;
+            };
+        } else {
+            const prev = rgba_frames[index - 1];
+            encodePFrame(&stream_writer, curr, prev) catch |err| {
+                if (err == error.NoSpaceLeft) {
+                    recordEncodeError(ctx, QovError.InvalidChunk);
+                } else {
+                    recordEncodeError(ctx, @errorCast(err));
+                }
+                return;
+            };
         }
-    } else if (frame_durations_us != null) {
-        return QovError.InvalidHeader;
+    } else {
+        const curr = ctx.frames[index];
+        if (use_iframe) {
+            encodeIFrame(&stream_writer, curr) catch |err| {
+                if (err == error.NoSpaceLeft) {
+                    recordEncodeError(ctx, QovError.InvalidChunk);
+                } else {
+                    recordEncodeError(ctx, @errorCast(err));
+                }
+                return;
+            };
+        } else {
+            const prev = ctx.frames[index - 1];
+            encodePFrame(&stream_writer, curr, prev) catch |err| {
+                if (err == error.NoSpaceLeft) {
+                    recordEncodeError(ctx, QovError.InvalidChunk);
+                } else {
+                    recordEncodeError(ctx, @errorCast(err));
+                }
+                return;
+            };
+        }
     }
 
-    const expected_bytes = headerFrameBytes(header);
-    for (frames) |frame| {
-        if (frame.len != expected_bytes) return QovError.FrameSizeMismatch;
-    }
+    ctx.payload_sizes[index] = stream.pos;
+}
 
-    try writeHeader(writer, header);
-
+fn encodeStreamSequential(allocator: std.mem.Allocator, writer: anytype, header: Header, frames: []const []const u8, frame_durations_us: ?[]const u32, default_frame_duration_us: u32) (QovError || std.mem.Allocator.Error || writerErrorType(@TypeOf(writer)))!void {
     var payload = std.ArrayList(u8).empty;
     defer payload.deinit(allocator);
 
@@ -296,13 +370,9 @@ pub fn encodeStream(allocator: std.mem.Allocator, writer: anytype, header: Heade
         if (rgba_a) |buffer| allocator.free(buffer);
         if (rgba_b) |buffer| allocator.free(buffer);
     }
+
     const gop_size = header.gop_size;
     const has_frame_metadata = header.flags.frame_metadata;
-    const default_frame_duration_us: u32 = if (has_frame_metadata and frame_durations_us == null) blk: {
-        const duration = @as(u64, header.fps_den) * 1_000_000 / @as(u64, header.fps_num);
-        if (duration == 0 or duration > std.math.maxInt(u32)) return QovError.InvalidHeader;
-        break :blk @intCast(duration);
-    } else 0;
 
     for (frames, 0..) |frame, index| {
         payload.clearRetainingCapacity();
@@ -349,6 +419,145 @@ pub fn encodeStream(allocator: std.mem.Allocator, writer: anytype, header: Heade
             .frame_duration_us = frame_duration_us,
         }, has_frame_metadata);
         try writeChunkPayload(writer, payload.items);
+    }
+}
+
+pub fn encodeStream(allocator: std.mem.Allocator, writer: anytype, header: Header, frames: []const []const u8, frame_durations_us: ?[]const u32) (QovError || std.mem.Allocator.Error || writerErrorType(@TypeOf(writer)))!void {
+    return encodeStreamWithOptions(allocator, writer, header, frames, frame_durations_us, .{});
+}
+
+pub fn encodeStreamWithOptions(allocator: std.mem.Allocator, writer: anytype, header: Header, frames: []const []const u8, frame_durations_us: ?[]const u32, options: EncodeOptions) (QovError || std.mem.Allocator.Error || writerErrorType(@TypeOf(writer)))!void {
+    try validateHeader(header);
+
+    if (header.frame_count != 0 and header.frame_count != frames.len) return QovError.InvalidHeader;
+    if (header.flags.frame_metadata) {
+        if (frame_durations_us) |durations| {
+            if (durations.len != frames.len) return QovError.InvalidHeader;
+        }
+    } else if (frame_durations_us != null) {
+        return QovError.InvalidHeader;
+    }
+
+    const expected_bytes = headerFrameBytes(header);
+    for (frames) |frame| {
+        if (frame.len != expected_bytes) return QovError.FrameSizeMismatch;
+    }
+
+    try writeHeader(writer, header);
+
+    const gop_size = header.gop_size;
+    const has_frame_metadata = header.flags.frame_metadata;
+    const default_frame_duration_us: u32 = if (has_frame_metadata and frame_durations_us == null) blk: {
+        const duration = @as(u64, header.fps_den) * 1_000_000 / @as(u64, header.fps_num);
+        if (duration == 0 or duration > std.math.maxInt(u32)) return QovError.InvalidHeader;
+        break :blk @intCast(duration);
+    } else 0;
+
+    if (options.parallel and frames.len > 1 and !builtin.single_threaded) {
+        var pool: std.Thread.Pool = undefined;
+        if (pool.init(.{ .allocator = allocator, .n_jobs = options.max_threads })) |_| {
+            defer pool.deinit();
+
+        const frame_count = frames.len;
+        const rgb_only = header.flags.rgb_only;
+        const payload_capacity = maxFramePayloadBytes(header);
+
+        var payload_buffers = try allocator.alloc([]u8, frame_count);
+        errdefer allocator.free(payload_buffers);
+        var payload_sizes = try allocator.alloc(usize, frame_count);
+        errdefer allocator.free(payload_sizes);
+
+        var payload_init: usize = 0;
+        errdefer {
+            for (payload_buffers[0..payload_init]) |payload| allocator.free(payload);
+        }
+        for (payload_buffers, 0..) |*payload, index| {
+            payload.* = try allocator.alloc(u8, payload_capacity);
+            payload_sizes[index] = 0;
+            payload_init += 1;
+        }
+        defer {
+            for (payload_buffers) |payload| allocator.free(payload);
+            allocator.free(payload_buffers);
+            allocator.free(payload_sizes);
+        }
+        payload_init = 0;
+
+        var rgba_frames: ?[][]u8 = null;
+        if (rgb_only) {
+            const rgba_bytes = headerFramePixels(header) * 4;
+            var buffers = try allocator.alloc([]u8, frame_count);
+            errdefer allocator.free(buffers);
+            var rgba_init: usize = 0;
+            errdefer {
+                for (buffers[0..rgba_init]) |buffer| allocator.free(buffer);
+            }
+            for (buffers, 0..) |*buffer, index| {
+                buffer.* = try allocator.alloc(u8, rgba_bytes);
+                expandRgbToRgba(buffer.*, frames[index]);
+                rgba_init += 1;
+            }
+            rgba_frames = buffers;
+            rgba_init = 0;
+        }
+        defer if (rgba_frames) |buffers| {
+            for (buffers) |buffer| allocator.free(buffer);
+            allocator.free(buffers);
+        };
+
+        const use_iframes = try allocator.alloc(bool, frame_count);
+        defer allocator.free(use_iframes);
+        for (use_iframes, 0..) |*use_iframe, index| {
+            use_iframe.* = index == 0 or gop_size == 0 or (index % gop_size == 0);
+        }
+
+        var wg: std.Thread.WaitGroup = .{};
+        var has_error = std.atomic.Value(bool).init(false);
+        var err_mutex = std.Thread.Mutex{};
+        var stored_err: ?QovError = null;
+
+        var ctx = EncodeJobContext{
+            .frames = frames,
+            .rgba_frames = rgba_frames,
+            .use_iframes = use_iframes,
+            .payload_buffers = payload_buffers,
+            .payload_sizes = payload_sizes,
+            .has_error = &has_error,
+            .err_mutex = &err_mutex,
+            .stored_err = &stored_err,
+            .rgb_only = rgb_only,
+        };
+
+        for (0..frame_count) |index| {
+            pool.spawnWg(&wg, encodeFrameJob, .{ &ctx, index });
+        }
+        pool.waitAndWork(&wg);
+
+        if (stored_err) |err| return err;
+
+        for (0..frame_count) |index| {
+            const use_iframe = use_iframes[index];
+            const frame_duration_us: u32 = if (has_frame_metadata) blk: {
+                if (frame_durations_us) |durations| {
+                    break :blk durations[index];
+                }
+                break :blk default_frame_duration_us;
+            } else 0;
+            const payload_size = payload_sizes[index];
+            if (payload_size > std.math.maxInt(u32)) return QovError.InvalidChunk;
+
+            try writeChunkHeader(writer, .{
+                .chunk_type = if (use_iframe) .iframe else .pframe,
+                .payload_size = @intCast(payload_size),
+                .frame_duration_us = frame_duration_us,
+            }, has_frame_metadata);
+            try writeChunkPayload(writer, payload_buffers[index][0..payload_size]);
+        }
+        } else |_| {
+            try encodeStreamSequential(allocator, writer, header, frames, frame_durations_us, default_frame_duration_us);
+        }
+    } else {
+        try encodeStreamSequential(allocator, writer, header, frames, frame_durations_us, default_frame_duration_us);
     }
 }
 
@@ -1167,6 +1376,59 @@ test "stream encode/decode roundtrip" {
 
     var encoded_writer = encoded.writer(std.testing.allocator);
     try encodeStream(std.testing.allocator, &encoded_writer, header, &frames, null);
+
+    var out0: [frame0.len]u8 = undefined;
+    var out1: [frame1.len]u8 = undefined;
+    var out_frames = [_][]u8{ &out0, &out1 };
+
+    var stream = std.io.fixedBufferStream(encoded.items);
+    var stream_reader = stream.reader();
+    const decoded_header = try decodeStream(std.testing.allocator, &stream_reader, &out_frames);
+
+    try std.testing.expectEqual(header.width, decoded_header.width);
+    try std.testing.expectEqual(header.height, decoded_header.height);
+    try std.testing.expectEqual(header.frame_count, decoded_header.frame_count);
+    try std.testing.expectEqualSlices(u8, &frame0, out_frames[0]);
+    try std.testing.expectEqualSlices(u8, &frame1, out_frames[1]);
+    try std.testing.expectEqual(encoded.items.len, stream.pos);
+}
+
+test "stream encode/decode roundtrip parallel" {
+    const header = Header{
+        .width = 2,
+        .height = 2,
+        .fps_num = 30,
+        .fps_den = 1,
+        .colorspace = .srgb,
+        .channels = .rgba,
+        .gop_size = 2,
+        .has_audio = false,
+        .audio_sample_rate = 0,
+        .audio_channels = 0,
+        .frame_count = 2,
+    };
+
+    const frame0 = [_]u8{
+        10, 20, 30, 255,
+        10, 20, 30, 255,
+        40, 50, 60, 255,
+        70, 80, 90, 255,
+    };
+
+    const frame1 = [_]u8{
+        10, 20, 30, 255,
+        10, 20, 30, 255,
+        41, 51, 61, 255,
+        70, 80, 90, 255,
+    };
+
+    const frames = [_][]const u8{ &frame0, &frame1 };
+
+    var encoded = std.ArrayList(u8).empty;
+    defer encoded.deinit(std.testing.allocator);
+
+    var encoded_writer = encoded.writer(std.testing.allocator);
+    try encodeStreamWithOptions(std.testing.allocator, &encoded_writer, header, &frames, null, .{ .parallel = true });
 
     var out0: [frame0.len]u8 = undefined;
     var out1: [frame1.len]u8 = undefined;
