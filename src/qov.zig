@@ -22,6 +22,7 @@
 ///     .has_audio = false,
 ///     .audio_sample_rate = 0,
 ///     .audio_channels = 0,
+///     .audio_frames_per_chunk = 0,
 ///     .frame_count = 1,
 /// };
 ///
@@ -97,6 +98,10 @@ pub const ChunkType = enum(u8) {
     audio = 2,
 };
 
+/// Audio chunk payloads are a concatenation of QOA frames. Each frame includes the
+/// 8-byte QOA header (channels, sample rate, frame length, frame size) followed by
+/// the frame payload. The number of frames per chunk is stored in the stream header.
+
 /// Stream header describing frame geometry and codec settings.
 pub const Header = struct {
     width: u16,
@@ -110,6 +115,7 @@ pub const Header = struct {
     has_audio: bool,
     audio_sample_rate: u32,
     audio_channels: u8,
+    audio_frames_per_chunk: u16,
     frame_count: u32,
 };
 
@@ -173,7 +179,16 @@ pub fn validateHeader(header: Header) QovError!void {
     } else {
         if (header.channels != .rgba) return QovError.UnsupportedChannels;
     }
-    if (header.has_audio) return QovError.UnsupportedAudio;
+    if (header.has_audio) {
+        if (header.audio_sample_rate == 0) return QovError.InvalidHeader;
+        if (header.audio_sample_rate > 0xFFFFFF) return QovError.InvalidHeader;
+        if (header.audio_channels == 0) return QovError.InvalidHeader;
+        if (header.audio_frames_per_chunk == 0) return QovError.InvalidHeader;
+    } else {
+        if (header.audio_sample_rate != 0) return QovError.InvalidHeader;
+        if (header.audio_channels != 0) return QovError.InvalidHeader;
+        if (header.audio_frames_per_chunk != 0) return QovError.InvalidHeader;
+    }
     if (header.fps_num == 0) return QovError.InvalidHeader;
     if (header.fps_den == 0) return QovError.InvalidHeader;
     if (header.width == 0 or header.height == 0) return QovError.InvalidHeader;
@@ -228,7 +243,20 @@ pub fn chunkHeaderSize(has_metadata: bool) usize {
 }
 
 fn readExact(reader: anytype, buf: []u8) (QovError || readerErrorType(@TypeOf(reader)))!void {
-    const amount = try reader.readAll(buf);
+    const ReaderT = switch (@typeInfo(@TypeOf(reader))) {
+        .pointer => |ptr_info| ptr_info.child,
+        else => @TypeOf(reader),
+    };
+    if (@hasDecl(ReaderT, "readSliceAll")) {
+        try reader.readSliceAll(buf);
+        return;
+    }
+    if (@hasDecl(ReaderT, "readAll")) {
+        const amount = try reader.readAll(buf);
+        if (amount != buf.len) return QovError.UnexpectedEof;
+        return;
+    }
+    const amount = try reader.readAtLeast(buf, buf.len);
     if (amount != buf.len) return QovError.UnexpectedEof;
 }
 
@@ -262,6 +290,7 @@ pub fn readHeader(reader: anytype) (QovError || readerErrorType(@TypeOf(reader))
         },
         .audio_sample_rate = (@as(u32, buf[17]) << 16) | (@as(u32, buf[18]) << 8) | @as(u32, buf[19]),
         .audio_channels = buf[20],
+        .audio_frames_per_chunk = std.mem.readInt(u16, buf[26..28], .big),
         .frame_count = std.mem.readInt(u32, buf[21..25], .big),
     };
 
@@ -273,8 +302,6 @@ pub fn readHeader(reader: anytype) (QovError || readerErrorType(@TypeOf(reader))
 /// Writes a validated QOV header to a stream.
 pub fn writeHeader(writer: anytype, header: Header) (QovError || writerErrorType(@TypeOf(writer)))!void {
     try validateHeader(header);
-    if (header.audio_sample_rate > 0xFFFFFF) return QovError.InvalidHeader;
-
     var buf: [header_size]u8 = undefined;
     @memset(&buf, 0);
 
@@ -294,6 +321,7 @@ pub fn writeHeader(writer: anytype, header: Header) (QovError || writerErrorType
     buf[20] = header.audio_channels;
     std.mem.writeInt(u32, buf[21..25], header.frame_count, .big);
     buf[25] = @bitCast(header.flags);
+    std.mem.writeInt(u16, buf[26..28], header.audio_frames_per_chunk, .big);
 
     try writer.writeAll(&buf);
 }
@@ -1246,6 +1274,7 @@ test "header validation for RGBA-only frames" {
         .has_audio = false,
         .audio_sample_rate = 0,
         .audio_channels = 0,
+        .audio_frames_per_chunk = 0,
         .frame_count = 0,
     };
 
@@ -1266,6 +1295,7 @@ test "header validation for RGB-only frames" {
         .has_audio = false,
         .audio_sample_rate = 0,
         .audio_channels = 0,
+        .audio_frames_per_chunk = 0,
         .frame_count = 0,
     };
 
@@ -1285,6 +1315,7 @@ test "header read/write roundtrip" {
         .has_audio = false,
         .audio_sample_rate = 0,
         .audio_channels = 0,
+        .audio_frames_per_chunk = 0,
         .frame_count = 12,
     };
 
@@ -1307,6 +1338,7 @@ test "header read/write roundtrip" {
     try std.testing.expectEqual(header.has_audio, decoded.has_audio);
     try std.testing.expectEqual(header.audio_sample_rate, decoded.audio_sample_rate);
     try std.testing.expectEqual(header.audio_channels, decoded.audio_channels);
+    try std.testing.expectEqual(header.audio_frames_per_chunk, decoded.audio_frames_per_chunk);
     try std.testing.expectEqual(header.frame_count, decoded.frame_count);
     try std.testing.expectEqual(header.flags, decoded.flags);
 }
@@ -1433,6 +1465,7 @@ test "stream encode/decode roundtrip" {
         .has_audio = false,
         .audio_sample_rate = 0,
         .audio_channels = 0,
+        .audio_frames_per_chunk = 0,
         .frame_count = 2,
     };
 
@@ -1486,6 +1519,7 @@ test "stream encode/decode roundtrip parallel" {
         .has_audio = false,
         .audio_sample_rate = 0,
         .audio_channels = 0,
+        .audio_frames_per_chunk = 0,
         .frame_count = 2,
     };
 
@@ -1540,6 +1574,7 @@ test "stream decoder exposes frame duration metadata" {
         .has_audio = false,
         .audio_sample_rate = 0,
         .audio_channels = 0,
+        .audio_frames_per_chunk = 0,
         .frame_count = 2,
     };
 
@@ -1593,6 +1628,7 @@ test "stream encode/decode roundtrip RGB-only" {
         .has_audio = false,
         .audio_sample_rate = 0,
         .audio_channels = 0,
+        .audio_frames_per_chunk = 0,
         .frame_count = 2,
     };
 
@@ -1642,6 +1678,7 @@ test "stream rejects frame size mismatches" {
         .has_audio = false,
         .audio_sample_rate = 0,
         .audio_channels = 0,
+        .audio_frames_per_chunk = 0,
         .frame_count = 1,
     };
 
@@ -1692,6 +1729,7 @@ test "stream decoder nextFrame helper" {
         .has_audio = false,
         .audio_sample_rate = 0,
         .audio_channels = 0,
+        .audio_frames_per_chunk = 0,
         .frame_count = 2,
     };
 

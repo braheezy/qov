@@ -27,6 +27,7 @@ pub fn main() !void {
         .has_audio = false,
         .audio_sample_rate = 0,
         .audio_channels = 0,
+        .audio_frames_per_chunk = 0,
         .frame_count = frames.len,
     };
 

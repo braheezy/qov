@@ -157,6 +157,7 @@ fn runEncode(allocator: std.mem.Allocator, output_path: []const u8, input_paths:
         .has_audio = false,
         .audio_sample_rate = 0,
         .audio_channels = 0,
+        .audio_frames_per_chunk = 0,
         .frame_count = @intCast(frames.items.len),
     };
 
@@ -484,6 +485,7 @@ test "cli info output includes frame metadata" {
         .has_audio = false,
         .audio_sample_rate = 0,
         .audio_channels = 0,
+        .audio_frames_per_chunk = 0,
         .frame_count = 2,
     };
 
@@ -548,6 +550,7 @@ test "cli info output notes disabled frame metadata" {
         .has_audio = false,
         .audio_sample_rate = 0,
         .audio_channels = 0,
+        .audio_frames_per_chunk = 0,
         .frame_count = 1,
     };
 

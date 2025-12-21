@@ -5,7 +5,7 @@ Goal: add QOA audio streams to QOV, reusing/adapting `qoa.zig`, and play audio w
 ## Tasks
 
 - [x] Review `qoa.zig` and extract minimal decode helpers for streaming PCM (target: f32 or s16) with frame-by-frame access. Added `src/qoa_stream.zig` with frame header parsing, s16/f32 decode helpers, and basic tests using `arcade.qoa`.
-- [ ] Define QOV audio chunk payload format and header fields (sample rate, channels, frames per chunk) in `src/qov.zig`.
+- [x] Define QOV audio chunk payload format and header fields (sample rate, channels, frames per chunk) in `src/qov.zig`. Added `audio_frames_per_chunk` to the header, documented the QOA frame-concatenated payload format, and updated header serialization/validation plus callers.
 - [ ] Implement audio chunk encode/decode helpers in `src/qov.zig` (read/write chunk headers + payload validation).
 - [ ] Extend `encodeStream` to optionally interleave audio chunks with video frames; decide mapping (e.g., 1 audio chunk per video frame or time-based chunking).
 - [ ] Extend `StreamDecoder` to expose audio frames (new `nextAudio()` or unified `nextPacket()` with tag) and validate audio metadata.

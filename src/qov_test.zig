@@ -98,6 +98,7 @@ test "qoi vector stream roundtrip" {
         .has_audio = false,
         .audio_sample_rate = 0,
         .audio_channels = 0,
+        .audio_frames_per_chunk = 0,
         .frame_count = @intCast(frames.items.len),
     };
 
@@ -169,6 +170,7 @@ test "stream encode/decode benchmark small frames" {
         .has_audio = false,
         .audio_sample_rate = 0,
         .audio_channels = 0,
+        .audio_frames_per_chunk = 0,
         .frame_count = @intCast(frame_count),
     };
 
@@ -281,6 +283,7 @@ test "stream chunk payload sizes match encoded payloads" {
         .has_audio = false,
         .audio_sample_rate = 0,
         .audio_channels = 0,
+        .audio_frames_per_chunk = 0,
         .frame_count = 2,
     };
 
@@ -349,6 +352,7 @@ test "stream decode stops on EOF when frame count unknown" {
         .has_audio = false,
         .audio_sample_rate = 0,
         .audio_channels = 0,
+        .audio_frames_per_chunk = 0,
         .frame_count = 0,
     };
 
@@ -434,6 +438,7 @@ test "malformed headers are rejected" {
         .has_audio = false,
         .audio_sample_rate = 0,
         .audio_channels = 0,
+        .audio_frames_per_chunk = 0,
         .frame_count = 1,
     };
 
@@ -478,6 +483,7 @@ test "unknown chunk types fail decoding" {
         .has_audio = false,
         .audio_sample_rate = 0,
         .audio_channels = 0,
+        .audio_frames_per_chunk = 0,
         .frame_count = 1,
     };
 
@@ -507,6 +513,7 @@ test "truncated streams error during decode" {
         .has_audio = false,
         .audio_sample_rate = 0,
         .audio_channels = 0,
+        .audio_frames_per_chunk = 0,
         .frame_count = 1,
     };
 
@@ -540,6 +547,7 @@ test "in-memory example encode/decode roundtrip" {
         .has_audio = false,
         .audio_sample_rate = 0,
         .audio_channels = 0,
+        .audio_frames_per_chunk = 0,
         .frame_count = 2,
     };
 
