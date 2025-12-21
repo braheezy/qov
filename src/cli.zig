@@ -1,3 +1,11 @@
+/// QOV command-line interface.
+/// Usage:
+///   qov encode <output.qov> <input1.qoi> [input2.qoi ...]
+///   qov decode <input.qov> <output_dir>
+///   qov info <input.qov>
+/// Example:
+///   qov encode anim.qov frame_000.qoi frame_001.qoi
+///   qov info anim.qov
 const std = @import("std");
 const qov = @import("qov");
 
@@ -27,6 +35,7 @@ const FrameInfo = struct {
     frame_duration_us: u32,
 };
 
+/// CLI entry point that dispatches subcommands.
 pub fn main() void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -520,6 +529,64 @@ test "cli info output includes frame metadata" {
             "  count: 2\n" ++
             "  [0] type=iframe payload_bytes=2 duration_us=10\n" ++
             "  [1] type=pframe payload_bytes=3 duration_us=20\n",
+        out.items,
+    );
+}
+
+test "cli info output notes disabled frame metadata" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    const header = qov.Header{
+        .width = 2,
+        .height = 3,
+        .fps_num = 30,
+        .fps_den = 1,
+        .colorspace = .srgb,
+        .channels = .rgba,
+        .gop_size = 4,
+        .has_audio = false,
+        .audio_sample_rate = 0,
+        .audio_channels = 0,
+        .frame_count = 1,
+    };
+
+    var writer = buffer.writer(std.testing.allocator);
+    try qov.writeHeader(&writer, header);
+    try qov.writeChunkHeader(&writer, .{
+        .chunk_type = .iframe,
+        .payload_size = 2,
+        .frame_duration_us = 0,
+    }, false);
+    try writer.writeAll(&[_]u8{ 0x01, 0x02 });
+
+    var stream = std.io.fixedBufferStream(buffer.items);
+    var stream_reader = stream.reader();
+    const parsed_header = try qov.readHeader(&stream_reader);
+    const frame_infos = try collectFrameMetadata(std.testing.allocator, &stream_reader, parsed_header);
+    defer std.testing.allocator.free(frame_infos);
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(std.testing.allocator);
+    var out_writer = out.writer(std.testing.allocator);
+    try writeInfo(&out_writer, parsed_header, frame_infos);
+
+    try std.testing.expectEqualStrings(
+        "Header:\n" ++
+            "  size: 2x3\n" ++
+            "  fps: 30/1\n" ++
+            "  colorspace: srgb\n" ++
+            "  channels: rgba\n" ++
+            "  flags: rgb_only=false, frame_metadata=false\n" ++
+            "  gop_size: 4\n" ++
+            "  has_audio: false\n" ++
+            "  audio_sample_rate: 0\n" ++
+            "  audio_channels: 0\n" ++
+            "  frame_count: 1\n" ++
+            "Frames:\n" ++
+            "  count: 1\n" ++
+            "  frame_duration_us: disabled\n" ++
+            "  [0] type=iframe payload_bytes=2\n",
         out.items,
     );
 }

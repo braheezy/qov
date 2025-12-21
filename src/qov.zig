@@ -1,3 +1,41 @@
+/// QOV container encode/decode helpers for in-memory frame streams.
+/// Example:
+/// ```
+/// const std = @import("std");
+/// const qov = @import("qov");
+///
+/// var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+/// defer _ = gpa.deinit();
+/// const allocator = gpa.allocator();
+///
+/// const frame0 = [_]u8{ 0x00, 0x00, 0x00, 0xFF };
+/// const frames = [_][]const u8{ &frame0 };
+///
+/// const header = qov.Header{
+///     .width = 1,
+///     .height = 1,
+///     .fps_num = 30,
+///     .fps_den = 1,
+///     .colorspace = .srgb,
+///     .channels = .rgba,
+///     .gop_size = 1,
+///     .has_audio = false,
+///     .audio_sample_rate = 0,
+///     .audio_channels = 0,
+///     .frame_count = 1,
+/// };
+///
+/// var encoded = std.ArrayList(u8).empty;
+/// defer encoded.deinit(allocator);
+/// var writer = encoded.writer(allocator);
+/// try qov.encodeStream(allocator, &writer, header, &frames, null);
+///
+/// var stream = std.io.fixedBufferStream(encoded.items);
+/// var reader = stream.reader();
+/// var out_frame: [4]u8 = undefined;
+/// var out_frames = [_][]u8{ &out_frame };
+/// _ = try qov.decodeStream(allocator, &reader, &out_frames);
+/// ```
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -15,38 +53,51 @@ fn readerErrorType(comptime ReaderType: type) type {
     };
 }
 
+/// Magic bytes used at the start of every QOV stream.
 pub const magic = [4]u8{ 'q', 'o', 'v', 'f' };
+/// Stream format version.
 pub const version: u8 = 1;
 
+/// Serialized header size in bytes.
 pub const header_size: usize = 32;
+/// Serialized chunk header size without per-frame metadata.
 pub const chunk_header_size: usize = 5;
+/// Serialized chunk header size with per-frame duration metadata.
 pub const chunk_header_metadata_size: usize = chunk_header_size + 4;
+/// End marker used by the QOV payload encoder.
 pub const end_marker = [8]u8{ 0, 0, 0, 0, 0, 0, 0, 1 };
+/// Header flag that marks a stream as RGB-only (alpha implied 0xFF).
 pub const header_flag_rgb_only: u8 = 1 << 0;
+/// Header flag that enables per-frame duration metadata.
 pub const header_flag_frame_metadata: u8 = 1 << 1;
 
+/// Supported colorspaces for QOV frames.
 pub const Colorspace = enum(u8) {
     srgb = 0,
     linear = 1,
 };
 
+/// Supported channel layouts for QOV frames.
 pub const Channels = enum(u8) {
     rgb = 3,
     rgba = 4,
 };
 
+/// Packed header flags stored in the stream header.
 pub const HeaderFlags = packed struct(u8) {
     rgb_only: bool = false,
     frame_metadata: bool = false,
     _reserved: u6 = 0,
 };
 
+/// Chunk types stored in the stream.
 pub const ChunkType = enum(u8) {
     iframe = 0,
     pframe = 1,
     audio = 2,
 };
 
+/// Stream header describing frame geometry and codec settings.
 pub const Header = struct {
     width: u16,
     height: u16,
@@ -62,17 +113,20 @@ pub const Header = struct {
     frame_count: u32,
 };
 
+/// Options for encoding, including optional parallel preprocessing.
 pub const EncodeOptions = struct {
     parallel: bool = false,
     max_threads: ?usize = null,
 };
 
+/// Chunk header describing the payload and optional duration metadata.
 pub const ChunkHeader = struct {
     chunk_type: ChunkType,
     payload_size: u32,
     frame_duration_us: u32 = 0,
 };
 
+/// Errors returned by QOV parsing and encoding helpers.
 pub const QovError = error{
     InvalidMagic,
     UnsupportedVersion,
@@ -85,27 +139,33 @@ pub const QovError = error{
     UnexpectedEof,
 };
 
+/// Returns true when the header declares audio streams.
 pub fn hasAudio(header: Header) bool {
     return header.has_audio;
 }
 
+/// Returns true when the header declares RGBA frames.
 pub fn isRgba(header: Header) bool {
     return header.channels == .rgba;
 }
 
+/// Returns true when the stream treats alpha as 0xFF.
 pub fn isRgbOnly(header: Header) bool {
     return header.flags.rgb_only;
 }
 
+/// Returns the number of pixels in each frame.
 pub fn headerFramePixels(header: Header) usize {
     return @as(usize, header.width) * @as(usize, header.height);
 }
 
+/// Returns the number of bytes per frame for the header layout.
 pub fn headerFrameBytes(header: Header) usize {
     const bytes_per_pixel: usize = if (header.flags.rgb_only) 3 else 4;
     return headerFramePixels(header) * bytes_per_pixel;
 }
 
+/// Validates header fields and flags for encoding/decoding.
 pub fn validateHeader(header: Header) QovError!void {
     if (header.flags._reserved != 0) return QovError.InvalidHeader;
     if (header.flags.rgb_only) {
@@ -119,6 +179,7 @@ pub fn validateHeader(header: Header) QovError!void {
     if (header.width == 0 or header.height == 0) return QovError.InvalidHeader;
 }
 
+/// Converts a serialized chunk type byte into a ChunkType.
 pub fn chunkTypeFromByte(byte: u8) QovError!ChunkType {
     return switch (byte) {
         0 => .iframe,
@@ -128,6 +189,7 @@ pub fn chunkTypeFromByte(byte: u8) QovError!ChunkType {
     };
 }
 
+/// Converts a serialized colorspace byte into a Colorspace.
 pub fn colorspaceFromByte(byte: u8) QovError!Colorspace {
     return switch (byte) {
         0 => .srgb,
@@ -136,6 +198,7 @@ pub fn colorspaceFromByte(byte: u8) QovError!Colorspace {
     };
 }
 
+/// Converts a serialized channel byte into a Channels enum.
 pub fn channelsFromByte(byte: u8) QovError!Channels {
     return switch (byte) {
         3 => .rgb,
@@ -144,18 +207,22 @@ pub fn channelsFromByte(byte: u8) QovError!Channels {
     };
 }
 
+/// Serializes a Channels value into a byte.
 pub fn channelByte(channels: Channels) u8 {
     return @intFromEnum(channels);
 }
 
+/// Serializes a Colorspace value into a byte.
 pub fn colorspaceByte(colorspace: Colorspace) u8 {
     return @intFromEnum(colorspace);
 }
 
+/// Serializes a ChunkType value into a byte.
 pub fn chunkTypeByte(chunk_type: ChunkType) u8 {
     return @intFromEnum(chunk_type);
 }
 
+/// Returns the serialized header size based on metadata availability.
 pub fn chunkHeaderSize(has_metadata: bool) usize {
     return if (has_metadata) chunk_header_metadata_size else chunk_header_size;
 }
@@ -171,6 +238,7 @@ fn readByteExact(reader: anytype) (QovError || readerErrorType(@TypeOf(reader)))
     return buf[0];
 }
 
+/// Reads and validates a QOV header from a stream.
 pub fn readHeader(reader: anytype) (QovError || readerErrorType(@TypeOf(reader)))!Header {
     var buf: [header_size]u8 = undefined;
     try readExact(reader, &buf);
@@ -202,6 +270,7 @@ pub fn readHeader(reader: anytype) (QovError || readerErrorType(@TypeOf(reader))
     return header;
 }
 
+/// Writes a validated QOV header to a stream.
 pub fn writeHeader(writer: anytype, header: Header) (QovError || writerErrorType(@TypeOf(writer)))!void {
     try validateHeader(header);
     if (header.audio_sample_rate > 0xFFFFFF) return QovError.InvalidHeader;
@@ -229,6 +298,7 @@ pub fn writeHeader(writer: anytype, header: Header) (QovError || writerErrorType
     try writer.writeAll(&buf);
 }
 
+/// Reads a chunk header, including duration metadata when enabled.
 pub fn readChunkHeader(reader: anytype, has_metadata: bool) (QovError || readerErrorType(@TypeOf(reader)))!ChunkHeader {
     var buf: [chunk_header_metadata_size]u8 = undefined;
     const header_len = chunkHeaderSize(has_metadata);
@@ -241,6 +311,7 @@ pub fn readChunkHeader(reader: anytype, has_metadata: bool) (QovError || readerE
     };
 }
 
+/// Writes a chunk header, including duration metadata when enabled.
 pub fn writeChunkHeader(writer: anytype, header: ChunkHeader, has_metadata: bool) (QovError || writerErrorType(@TypeOf(writer)))!void {
     var buf: [chunk_header_metadata_size]u8 = undefined;
     buf[0] = chunkTypeByte(header.chunk_type);
@@ -253,10 +324,12 @@ pub fn writeChunkHeader(writer: anytype, header: ChunkHeader, has_metadata: bool
     }
 }
 
+/// Reads an exact chunk payload into the provided buffer.
 pub fn readChunkPayload(reader: anytype, payload: []u8) (QovError || readerErrorType(@TypeOf(reader)))!void {
     try readExact(reader, payload);
 }
 
+/// Writes a chunk payload to the stream.
 pub fn writeChunkPayload(writer: anytype, payload: []const u8) (QovError || writerErrorType(@TypeOf(writer)))!void {
     try writer.writeAll(payload);
 }
@@ -422,10 +495,12 @@ fn encodeStreamSequential(allocator: std.mem.Allocator, writer: anytype, header:
     }
 }
 
+/// Encodes a full stream with default options.
 pub fn encodeStream(allocator: std.mem.Allocator, writer: anytype, header: Header, frames: []const []const u8, frame_durations_us: ?[]const u32) (QovError || std.mem.Allocator.Error || writerErrorType(@TypeOf(writer)))!void {
     return encodeStreamWithOptions(allocator, writer, header, frames, frame_durations_us, .{});
 }
 
+/// Encodes a stream with configurable options, including parallel preprocessing.
 pub fn encodeStreamWithOptions(allocator: std.mem.Allocator, writer: anytype, header: Header, frames: []const []const u8, frame_durations_us: ?[]const u32, options: EncodeOptions) (QovError || std.mem.Allocator.Error || writerErrorType(@TypeOf(writer)))!void {
     try validateHeader(header);
 
@@ -561,6 +636,7 @@ pub fn encodeStreamWithOptions(allocator: std.mem.Allocator, writer: anytype, he
     }
 }
 
+/// Streaming decoder that reads headers once and advances frame-by-frame.
 pub fn StreamDecoder(comptime ReaderType: type) type {
     return struct {
         allocator: std.mem.Allocator,
@@ -666,6 +742,7 @@ pub fn StreamDecoder(comptime ReaderType: type) type {
     };
 }
 
+/// Decodes a full stream into preallocated frame buffers.
 pub fn decodeStream(allocator: std.mem.Allocator, reader: anytype, frames: [][]u8) (QovError || std.mem.Allocator.Error || readerErrorType(@TypeOf(reader)))!Header {
     var decoder = try StreamDecoder(@TypeOf(reader)).init(allocator, reader);
     defer decoder.deinit();
@@ -743,6 +820,7 @@ fn stripRgbaToRgb(dst: []u8, src: []const u8) void {
     }
 }
 
+/// Encodes a standalone iframe payload for RGBA pixels.
 pub fn encodeIFrame(writer: anytype, pixels: []const u8) (QovError || writerErrorType(@TypeOf(writer)))!void {
     if (pixels.len % 4 != 0) return QovError.InvalidChunk;
 
@@ -815,6 +893,7 @@ pub fn encodeIFrame(writer: anytype, pixels: []const u8) (QovError || writerErro
     try writer.writeAll(&end_marker);
 }
 
+/// Decodes a standalone iframe payload into RGBA pixels.
 pub fn decodeIFrame(reader: anytype, pixels: []u8) (QovError || readerErrorType(@TypeOf(reader)))!void {
     if (pixels.len % 4 != 0) return QovError.InvalidChunk;
 
@@ -887,6 +966,7 @@ pub fn decodeIFrame(reader: anytype, pixels: []u8) (QovError || readerErrorType(
     if (!std.mem.eql(u8, &marker, &end_marker)) return QovError.InvalidChunk;
 }
 
+/// Encodes a delta pframe payload using a previous RGBA frame.
 pub fn encodePFrame(writer: anytype, pixels: []const u8, prev_pixels: []const u8) (QovError || writerErrorType(@TypeOf(writer)))!void {
     if (pixels.len % 4 != 0) return QovError.InvalidChunk;
     if (pixels.len != prev_pixels.len) return QovError.InvalidChunk;
@@ -975,6 +1055,7 @@ pub fn encodePFrame(writer: anytype, pixels: []const u8, prev_pixels: []const u8
     try writer.writeAll(&end_marker);
 }
 
+/// Decodes a delta pframe payload using a previous RGBA frame.
 pub fn decodePFrame(reader: anytype, pixels: []u8, prev_pixels: []const u8) (QovError || readerErrorType(@TypeOf(reader)))!void {
     if (pixels.len % 4 != 0) return QovError.InvalidChunk;
     if (pixels.len != prev_pixels.len) return QovError.InvalidChunk;
