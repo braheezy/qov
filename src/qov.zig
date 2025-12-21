@@ -777,6 +777,11 @@ pub fn StreamDecoder(comptime ReaderType: type) type {
         frame_index: usize = 0,
         last_frame_duration_us: u32 = 0,
 
+        pub const StreamPacket = union(enum) {
+            frame: void,
+            audio: []const u8,
+        };
+
         pub fn init(allocator: std.mem.Allocator, reader: ReaderType) (QovError || std.mem.Allocator.Error || readerErrorType(ReaderType))!@This() {
             const header = try readHeader(reader);
             var decoder = @This(){
@@ -810,62 +815,86 @@ pub fn StreamDecoder(comptime ReaderType: type) type {
         pub fn nextFrame(self: *@This(), frame: []u8) (QovError || std.mem.Allocator.Error || readerErrorType(ReaderType))!bool {
             const expected_bytes = headerFrameBytes(self.header);
             if (frame.len != expected_bytes) return QovError.FrameSizeMismatch;
+            while (true) {
+                const packet = try self.nextPacket(frame);
+                if (packet == null) return false;
+                switch (packet.?) {
+                    .frame => return true,
+                    .audio => continue,
+                }
+            }
+        }
 
-            if (self.header.frame_count != 0 and self.frame_index >= self.header.frame_count) return false;
-
+        pub fn nextPacket(self: *@This(), frame: ?[]u8) (QovError || std.mem.Allocator.Error || readerErrorType(ReaderType))!?StreamPacket {
             const chunk_header = readChunkHeader(self.reader, self.header.flags.frame_metadata) catch |err| switch (err) {
                 QovError.UnexpectedEof => {
-                    if (self.header.frame_count == 0) return false;
+                    if (self.header.frame_count == 0) return null;
+                    if (self.frame_index >= self.header.frame_count) return null;
                     return err;
                 },
                 else => return err,
             };
             const payload_size: usize = @intCast(chunk_header.payload_size);
-            self.last_frame_duration_us = chunk_header.frame_duration_us;
 
             try self.payload.resize(self.allocator, payload_size);
             try readChunkPayload(self.reader, self.payload.items);
 
-            var stream = std.io.fixedBufferStream(self.payload.items);
-            var stream_reader = stream.reader();
-
             switch (chunk_header.chunk_type) {
-                .iframe => {
-                    if (self.header.flags.rgb_only) {
-                        const curr = self.rgba_curr orelse return QovError.InvalidChunk;
-                        const prev = self.rgba_prev orelse return QovError.InvalidChunk;
-                        try decodeIFrame(&stream_reader, curr);
-                        stripRgbaToRgb(frame, curr);
-                        self.rgba_curr = prev;
-                        self.rgba_prev = curr;
-                        self.prev_pixels = self.rgba_prev;
-                    } else {
-                        try decodeIFrame(&stream_reader, frame);
-                        self.prev_pixels = frame;
-                    }
+                .audio => {
+                    if (!self.header.has_audio) return QovError.InvalidChunk;
+                    try validateAudioChunkPayload(self.header, self.payload.items);
+                    return StreamPacket{ .audio = self.payload.items };
                 },
-                .pframe => {
-                    const prev = self.prev_pixels orelse return QovError.InvalidChunk;
-                    if (self.header.flags.rgb_only) {
-                        const curr = self.rgba_curr orelse return QovError.InvalidChunk;
-                        const prev_rgba = self.rgba_prev orelse return QovError.InvalidChunk;
-                        try decodePFrame(&stream_reader, curr, prev_rgba);
-                        stripRgbaToRgb(frame, curr);
-                        self.rgba_curr = prev_rgba;
-                        self.rgba_prev = curr;
-                        self.prev_pixels = self.rgba_prev;
-                    } else {
-                        try decodePFrame(&stream_reader, frame, prev);
-                        self.prev_pixels = frame;
+                .iframe, .pframe => {
+                    const expected_bytes = headerFrameBytes(self.header);
+                    const frame_buf = frame orelse return QovError.FrameSizeMismatch;
+                    if (frame_buf.len != expected_bytes) return QovError.FrameSizeMismatch;
+                    if (self.header.frame_count != 0 and self.frame_index >= self.header.frame_count) return QovError.InvalidChunk;
+
+                    self.last_frame_duration_us = chunk_header.frame_duration_us;
+
+                    var stream = std.io.fixedBufferStream(self.payload.items);
+                    var stream_reader = stream.reader();
+
+                    switch (chunk_header.chunk_type) {
+                        .iframe => {
+                            if (self.header.flags.rgb_only) {
+                                const curr = self.rgba_curr orelse return QovError.InvalidChunk;
+                                const prev = self.rgba_prev orelse return QovError.InvalidChunk;
+                                try decodeIFrame(&stream_reader, curr);
+                                stripRgbaToRgb(frame_buf, curr);
+                                self.rgba_curr = prev;
+                                self.rgba_prev = curr;
+                                self.prev_pixels = self.rgba_prev;
+                            } else {
+                                try decodeIFrame(&stream_reader, frame_buf);
+                                self.prev_pixels = frame_buf;
+                            }
+                        },
+                        .pframe => {
+                            const prev = self.prev_pixels orelse return QovError.InvalidChunk;
+                            if (self.header.flags.rgb_only) {
+                                const curr = self.rgba_curr orelse return QovError.InvalidChunk;
+                                const prev_rgba = self.rgba_prev orelse return QovError.InvalidChunk;
+                                try decodePFrame(&stream_reader, curr, prev_rgba);
+                                stripRgbaToRgb(frame_buf, curr);
+                                self.rgba_curr = prev_rgba;
+                                self.rgba_prev = curr;
+                                self.prev_pixels = self.rgba_prev;
+                            } else {
+                                try decodePFrame(&stream_reader, frame_buf, prev);
+                                self.prev_pixels = frame_buf;
+                            }
+                        },
+                        else => return QovError.InvalidChunk,
                     }
+
+                    if (stream.pos != self.payload.items.len) return QovError.InvalidChunk;
+
+                    self.frame_index += 1;
+                    return StreamPacket{ .frame = {} };
                 },
-                .audio => return QovError.UnsupportedAudio,
             }
-
-            if (stream.pos != self.payload.items.len) return QovError.InvalidChunk;
-
-            self.frame_index += 1;
-            return true;
         }
     };
 }
@@ -1728,6 +1757,83 @@ test "stream encode interleaves audio chunks" {
         }
     }
 
+    try std.testing.expectEqual(encoded.items.len, stream.pos);
+}
+
+test "stream decoder exposes audio packets" {
+    var file = try std.fs.cwd().openFile("arcade.qoa", .{});
+    defer file.close();
+
+    var file_header: [8]u8 = undefined;
+    _ = try file.readAll(&file_header);
+
+    var frame_header_bytes: [8]u8 = undefined;
+    const header_len = try file.readAll(&frame_header_bytes);
+    try std.testing.expectEqual(@as(usize, 8), header_len);
+
+    const frame_header = try qoa_stream.parseFrameHeader(&frame_header_bytes);
+    const frame_size: usize = @intCast(frame_header.frame_size);
+    var frame_payload = try std.testing.allocator.alloc(u8, frame_size);
+    defer std.testing.allocator.free(frame_payload);
+
+    std.mem.copyForwards(u8, frame_payload[0..8], &frame_header_bytes);
+    const payload_read = try file.readAll(frame_payload[8..frame_size]);
+    try std.testing.expectEqual(frame_size - 8, payload_read);
+
+    const header = Header{
+        .width = 1,
+        .height = 1,
+        .fps_num = 30,
+        .fps_den = 1,
+        .colorspace = .srgb,
+        .channels = .rgba,
+        .gop_size = 2,
+        .has_audio = true,
+        .audio_sample_rate = frame_header.sample_rate,
+        .audio_channels = frame_header.channels,
+        .audio_frames_per_chunk = 1,
+        .frame_count = 2,
+    };
+
+    const frame0 = [_]u8{ 10, 20, 30, 255 };
+    const frame1 = [_]u8{ 12, 22, 32, 255 };
+    const frames = [_][]const u8{ &frame0, &frame1 };
+
+    const audio_chunks = [_][]const u8{ frame_payload, frame_payload, frame_payload };
+
+    var encoded = std.ArrayList(u8).empty;
+    defer encoded.deinit(std.testing.allocator);
+
+    var encoded_writer = encoded.writer(std.testing.allocator);
+    try encodeStreamWithOptions(std.testing.allocator, &encoded_writer, header, &frames, null, .{ .audio_chunks = &audio_chunks });
+
+    var stream = std.io.fixedBufferStream(encoded.items);
+    var stream_reader = stream.reader();
+    var decoder = try StreamDecoder(@TypeOf(&stream_reader)).init(std.testing.allocator, &stream_reader);
+    defer decoder.deinit();
+
+    var frame_out: [frame0.len]u8 = undefined;
+    var frame_index: usize = 0;
+    var audio_count: usize = 0;
+
+    while (true) {
+        const packet = try decoder.nextPacket(&frame_out);
+        if (packet == null) break;
+        switch (packet.?) {
+            .frame => {
+                try std.testing.expect(frame_index < frames.len);
+                try std.testing.expectEqualSlices(u8, frames[frame_index], &frame_out);
+                frame_index += 1;
+            },
+            .audio => |payload| {
+                try std.testing.expectEqualSlices(u8, frame_payload, payload);
+                audio_count += 1;
+            },
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), frame_index);
+    try std.testing.expectEqual(@as(usize, 3), audio_count);
     try std.testing.expectEqual(encoded.items.len, stream.pos);
 }
 
