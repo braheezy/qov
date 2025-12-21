@@ -1,6 +1,6 @@
 /// QOV command-line interface.
 /// Usage:
-///   qov encode <output.qov> <input1.qoi> [input2.qoi ...]
+///   qov encode [--audio input.qoa] <output.qov> <input1.qoi> [input2.qoi ...]
 ///   qov decode <input.qov> <output_dir>
 ///   qov info <input.qov>
 /// Example:
@@ -22,6 +22,7 @@ const QoiHeader = struct {
 const CliError = error{
     InvalidArgs,
     InvalidQoi,
+    InvalidQoa,
     UnsupportedQoi,
     FrameSizeMismatch,
     InvalidQov,
@@ -64,7 +65,8 @@ fn runMain(allocator: std.mem.Allocator) !void {
             try printUsage();
             return CliError.InvalidArgs;
         }
-        try runEncode(allocator, args[2], args[3..]);
+        const encode_args = try parseEncodeArgs(args[2..]);
+        try runEncode(allocator, encode_args.output_path, encode_args.input_paths, encode_args.audio_path);
     } else if (std.mem.eql(u8, command, "decode")) {
         if (args.len != 4) {
             try printUsage();
@@ -93,7 +95,7 @@ fn printStderr(comptime fmt: []const u8, args: anytype) !void {
 fn printUsage() !void {
     try printStderr(
         "Usage:\n" ++
-            "  qov encode <output.qov> <input1.qoi> [input2.qoi ...]\n" ++
+            "  qov encode [--audio input.qoa] <output.qov> <input1.qoi> [input2.qoi ...]\n" ++
             "  qov decode <input.qov> <output_dir>\n" ++
             "  qov info <input.qov>\n",
         .{},
@@ -103,11 +105,59 @@ fn printUsage() !void {
 fn isReportedError(err: anyerror) bool {
     return err == CliError.InvalidArgs or
         err == CliError.InvalidQoi or
+        err == CliError.InvalidQoa or
         err == CliError.UnsupportedQoi or
         err == CliError.FrameSizeMismatch;
 }
 
-fn runEncode(allocator: std.mem.Allocator, output_path: []const u8, input_paths: []const []const u8) !void {
+const EncodeArgs = struct {
+    output_path: []const u8,
+    input_paths: []const []const u8,
+    audio_path: ?[]const u8,
+};
+
+const AudioPayloads = struct {
+    bytes: []u8,
+    chunks: []const []const u8,
+    sample_rate: u32,
+    channels: u8,
+    frames_per_chunk: u16,
+
+    fn deinit(self: *AudioPayloads, allocator: std.mem.Allocator) void {
+        allocator.free(self.bytes);
+        allocator.free(self.chunks);
+        self.* = undefined;
+    }
+};
+
+fn parseEncodeArgs(args: []const []const u8) !EncodeArgs {
+    var index: usize = 0;
+    var audio_path: ?[]const u8 = null;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--audio") or std.mem.eql(u8, arg, "-a")) {
+            if (audio_path != null) return CliError.InvalidArgs;
+            index += 1;
+            if (index >= args.len) return CliError.InvalidArgs;
+            audio_path = args[index];
+            continue;
+        }
+        break;
+    }
+
+    if (index >= args.len) return CliError.InvalidArgs;
+    const output_path = args[index];
+    index += 1;
+    if (index >= args.len) return CliError.InvalidArgs;
+
+    return .{
+        .output_path = output_path,
+        .input_paths = args[index..],
+        .audio_path = audio_path,
+    };
+}
+
+fn runEncode(allocator: std.mem.Allocator, output_path: []const u8, input_paths: []const []const u8, audio_path: ?[]const u8) !void {
     var frames = std.ArrayList([]u8).empty;
     defer {
         for (frames.items) |frame| allocator.free(frame);
@@ -146,7 +196,19 @@ fn runEncode(allocator: std.mem.Allocator, output_path: []const u8, input_paths:
         return CliError.InvalidQov;
     }
 
-    const header = qov.Header{
+    var audio_payloads: ?AudioPayloads = null;
+    defer if (audio_payloads) |*payloads| payloads.deinit(allocator);
+
+    if (audio_path) |path| {
+        audio_payloads = loadQoaAudio(allocator, path) catch |err| {
+            if (err == CliError.InvalidQoa) {
+                try reportInvalidQoa(path);
+            }
+            return err;
+        };
+    }
+
+    var header = qov.Header{
         .width = @intCast(width),
         .height = @intCast(height),
         .fps_num = 30,
@@ -161,12 +223,21 @@ fn runEncode(allocator: std.mem.Allocator, output_path: []const u8, input_paths:
         .frame_count = @intCast(frames.items.len),
     };
 
+    var encode_options = qov.EncodeOptions{};
+    if (audio_payloads) |payloads| {
+        header.has_audio = true;
+        header.audio_sample_rate = payloads.sample_rate;
+        header.audio_channels = payloads.channels;
+        header.audio_frames_per_chunk = payloads.frames_per_chunk;
+        encode_options.audio_chunks = payloads.chunks;
+    }
+
     var out_file = try std.fs.cwd().createFile(output_path, .{ .truncate = true });
     defer out_file.close();
 
     var out_buf: [8192]u8 = undefined;
     var out_writer = out_file.writer(&out_buf);
-    try qov.encodeStream(allocator, &out_writer.interface, header, frames.items, null);
+    try qov.encodeStreamWithOptions(allocator, &out_writer.interface, header, frames.items, null, encode_options);
     try out_writer.interface.flush();
 }
 
@@ -245,6 +316,10 @@ fn runInfo(allocator: std.mem.Allocator, input_path: []const u8) !void {
 fn reportInvalidQoi(path: []const u8, err: anyerror) !void {
     const reason = describeQoiError(err);
     try printStderr("error: invalid QOI input '{s}': {s}\n", .{ path, reason });
+}
+
+fn reportInvalidQoa(path: []const u8) !void {
+    try printStderr("error: invalid QOA input '{s}'\n", .{ path });
 }
 
 fn reportFrameSizeMismatch(base_path: []const u8, path: []const u8, expected_width: u32, expected_height: u32, actual_width: u32, actual_height: u32) !void {
@@ -355,6 +430,54 @@ fn readExact(reader: anytype, buf: []u8) !void {
     if (amount != buf.len) return CliError.InvalidQoi;
 }
 
+fn loadQoaAudio(allocator: std.mem.Allocator, path: []const u8) !AudioPayloads {
+    const file_bytes = try std.fs.cwd().readFileAlloc(allocator, path, std.math.maxInt(usize));
+    errdefer allocator.free(file_bytes);
+
+    if (file_bytes.len < 8) return CliError.InvalidQoa;
+    if (!std.mem.eql(u8, file_bytes[0..4], "qoaf")) return CliError.InvalidQoa;
+
+    const total_samples = std.mem.readInt(u32, file_bytes[4..8], .big);
+    if (total_samples == 0) return CliError.InvalidQoa;
+
+    var chunks = std.ArrayList([]const u8).empty;
+    errdefer chunks.deinit(allocator);
+
+    var offset: usize = 8;
+    var channels: u8 = 0;
+    var sample_rate: u32 = 0;
+    while (offset < file_bytes.len) {
+        if (offset + 8 > file_bytes.len) return CliError.InvalidQoa;
+        const frame_header = qov.parseQoaFrameHeader(file_bytes[offset..]) catch {
+            return CliError.InvalidQoa;
+        };
+        if (frame_header.frame_size < 8) return CliError.InvalidQoa;
+
+        const frame_size: usize = @intCast(frame_header.frame_size);
+        if (offset + frame_size > file_bytes.len) return CliError.InvalidQoa;
+
+        if (channels == 0) {
+            channels = frame_header.channels;
+            sample_rate = frame_header.sample_rate;
+        } else if (channels != frame_header.channels or sample_rate != frame_header.sample_rate) {
+            return CliError.InvalidQoa;
+        }
+
+        try chunks.append(allocator, file_bytes[offset .. offset + frame_size]);
+        offset += frame_size;
+    }
+    if (offset != file_bytes.len) return CliError.InvalidQoa;
+    if (channels == 0 or sample_rate == 0) return CliError.InvalidQoa;
+
+    return .{
+        .bytes = file_bytes,
+        .chunks = try chunks.toOwnedSlice(allocator),
+        .sample_rate = sample_rate,
+        .channels = channels,
+        .frames_per_chunk = 1,
+    };
+}
+
 fn collectFrameMetadata(allocator: std.mem.Allocator, reader: anytype, header: qov.Header) ![]FrameInfo {
     var infos = std.ArrayList(FrameInfo).empty;
     errdefer infos.deinit(allocator);
@@ -455,6 +578,16 @@ test "cli QOI error descriptions" {
     try std.testing.expectEqualStrings("unsupported QOI channels/colorspace", describeQoiError(CliError.UnsupportedQoi));
     try std.testing.expectEqualStrings("invalid QOI data chunk", describeQoiError(qov.QovError.InvalidChunk));
     try std.testing.expectEqualStrings("unexpected EOF while reading QOI data", describeQoiError(qov.QovError.UnexpectedEof));
+}
+
+test "cli reads QOA audio metadata" {
+    var audio = try loadQoaAudio(std.testing.allocator, "arcade.qoa");
+    defer audio.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 24000), audio.sample_rate);
+    try std.testing.expectEqual(@as(u8, 2), audio.channels);
+    try std.testing.expectEqual(@as(u16, 1), audio.frames_per_chunk);
+    try std.testing.expect(audio.chunks.len > 0);
 }
 
 test "cli frame size mismatch message includes sizes" {

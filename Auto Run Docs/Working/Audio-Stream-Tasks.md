@@ -9,7 +9,7 @@ Goal: add QOA audio streams to QOV, reusing/adapting `qoa.zig`, and play audio w
 - [x] Implement audio chunk encode/decode helpers in `src/qov.zig` (read/write chunk headers + payload validation). Added QOA payload validation plus read/write helpers and a basic audio chunk roundtrip test using `arcade.qoa`.
 - [x] Extend `encodeStream` to optionally interleave audio chunks with video frames; decide mapping (e.g., 1 audio chunk per video frame or time-based chunking).
 - [x] Extend `StreamDecoder` to expose audio frames (new `nextAudio()` or unified `nextPacket()` with tag) and validate audio metadata. Added `nextPacket` to surface audio payloads with QOA validation, updated `nextFrame` to skip audio, and covered interleaved audio/video via a new decoder test.
-- [ ] Update CLI `qov encode` to accept a `.qoa` file (e.g., `--audio arcade.qoa`) and store audio metadata in the header.
+- [x] Update CLI `qov encode` to accept a `.qoa` file (e.g., `--audio arcade.qoa`) and store audio metadata in the header. Added `--audio/-a` parsing, QOA header/frame parsing, and audio chunk interleaving via `encodeStreamWithOptions`.
 - [ ] Update CLI `qov decode` to optionally dump audio chunks to `.qoa` or raw PCM for verification.
 - [ ] Update SDL player to open an audio device, queue decoded PCM, and keep A/V in sync (tolerate longer audio than video).
 - [ ] Add tests in `src/qov_test.zig` for audio header validation, chunk read/write, and end-of-stream behavior.

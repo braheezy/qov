@@ -150,6 +150,12 @@ pub const QovError = error{
     UnexpectedEof,
 };
 
+pub const QoaFrameHeader = qoa_stream.FrameHeader;
+
+pub fn parseQoaFrameHeader(bytes: []const u8) !qoa_stream.FrameHeader {
+    return qoa_stream.parseFrameHeader(bytes);
+}
+
 /// Returns true when the header declares audio streams.
 pub fn hasAudio(header: Header) bool {
     return header.has_audio;
