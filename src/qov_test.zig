@@ -133,6 +133,73 @@ test "qoi vector stream roundtrip" {
     try std.testing.expectEqual(encoded.items.len, stream.pos);
 }
 
+test "stream encode/decode benchmark small frames" {
+    const width: u32 = 64;
+    const height: u32 = 64;
+    const frame_count: usize = 12;
+    const frame_bytes = @as(usize, width) * @as(usize, height) * 4;
+
+    const frames = try std.testing.allocator.alloc([]u8, frame_count);
+    defer {
+        for (frames) |frame| std.testing.allocator.free(frame);
+        std.testing.allocator.free(frames);
+    }
+
+    for (frames, 0..) |*frame, frame_index| {
+        frame.* = try std.testing.allocator.alloc(u8, frame_bytes);
+        const seed: u8 = @intCast((frame_index * 17) % 251);
+        var offset: usize = 0;
+        while (offset < frame_bytes) : (offset += 4) {
+            const base: u8 = @intCast(offset % 251);
+            frame.*[offset] = seed +% base;
+            frame.*[offset + 1] = seed +% base +% 1;
+            frame.*[offset + 2] = seed +% base +% 2;
+            frame.*[offset + 3] = 255;
+        }
+    }
+
+    const header = qov.Header{
+        .width = width,
+        .height = height,
+        .fps_num = 30,
+        .fps_den = 1,
+        .colorspace = .srgb,
+        .channels = .rgba,
+        .gop_size = 6,
+        .has_audio = false,
+        .audio_sample_rate = 0,
+        .audio_channels = 0,
+        .frame_count = @intCast(frame_count),
+    };
+
+    var encoded = std.ArrayList(u8).empty;
+    defer encoded.deinit(std.testing.allocator);
+    var encoded_writer = encoded.writer(std.testing.allocator);
+
+    var timer = try std.time.Timer.start();
+    try qov.encodeStream(std.testing.allocator, &encoded_writer, header, frames);
+
+    const out_frame_bytes = qov.headerFrameBytes(header);
+    const out_frames = try std.testing.allocator.alloc([]u8, frame_count);
+    defer {
+        for (out_frames) |frame| std.testing.allocator.free(frame);
+        std.testing.allocator.free(out_frames);
+    }
+    for (out_frames) |*frame| {
+        frame.* = try std.testing.allocator.alloc(u8, out_frame_bytes);
+    }
+
+    var stream = std.io.fixedBufferStream(encoded.items);
+    var reader = stream.reader();
+    const decoded_header = try qov.decodeStream(std.testing.allocator, &reader, out_frames);
+    const elapsed_ns = timer.read();
+
+    try std.testing.expectEqual(header.frame_count, decoded_header.frame_count);
+    try std.testing.expectEqualSlices(u8, frames[0], out_frames[0]);
+    try std.testing.expectEqualSlices(u8, frames[frame_count - 1], out_frames[frame_count - 1]);
+    try std.testing.expect(elapsed_ns < 2 * std.time.ns_per_s);
+}
+
 test "I-frame run boundary lengths" {
     const pixel = [_]u8{ 0, 0, 0, 255 };
 

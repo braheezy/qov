@@ -15,4 +15,5 @@ This phase tightens streaming ergonomics, improves error handling, and expands t
 - [x] Add frame-count streaming behavior: support `frame_count = 0` (unknown) and ensure decode ends on EOF.
 - [x] Improve CLI validation and error messages for mismatched frame sizes or invalid QOI inputs.
   - Added CLI stderr messaging for QOI decode failures and frame size mismatches, plus small helper tests for message formatting in `src/cli.zig`.
-- [ ] Benchmark a small multi-frame encode/decode in tests to guard performance regressions.
+- [x] Benchmark a small multi-frame encode/decode in tests to guard performance regressions.
+  - Added a timed multi-frame encode/decode test with a generous ceiling to catch large regressions in `src/qov_test.zig`.
