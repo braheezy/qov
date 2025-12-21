@@ -20,6 +20,13 @@ const CliError = error{
     StreamingNotSupported,
 };
 
+const FrameInfo = struct {
+    index: usize,
+    chunk_type: qov.ChunkType,
+    payload_size: u32,
+    frame_duration_us: u32,
+};
+
 pub fn main() void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -55,6 +62,12 @@ fn runMain(allocator: std.mem.Allocator) !void {
             return CliError.InvalidArgs;
         }
         try runDecode(allocator, args[2], args[3]);
+    } else if (std.mem.eql(u8, command, "info")) {
+        if (args.len != 3) {
+            try printUsage();
+            return CliError.InvalidArgs;
+        }
+        try runInfo(allocator, args[2]);
     } else {
         try printUsage();
         return CliError.InvalidArgs;
@@ -72,7 +85,8 @@ fn printUsage() !void {
     try printStderr(
         "Usage:\n" ++
             "  qov encode <output.qov> <input1.qoi> [input2.qoi ...]\n" ++
-            "  qov decode <input.qov> <output_dir>\n",
+            "  qov decode <input.qov> <output_dir>\n" ++
+            "  qov info <input.qov>\n",
         .{},
     );
 }
@@ -202,6 +216,22 @@ fn runDecode(allocator: std.mem.Allocator, input_path: []const u8, output_dir: [
     }
 }
 
+fn runInfo(allocator: std.mem.Allocator, input_path: []const u8) !void {
+    const file_bytes = try std.fs.cwd().readFileAlloc(allocator, input_path, std.math.maxInt(usize));
+    defer allocator.free(file_bytes);
+
+    var stream = std.io.fixedBufferStream(file_bytes);
+    var stream_reader = stream.reader();
+    const header = try qov.readHeader(&stream_reader);
+    const frame_infos = try collectFrameMetadata(allocator, &stream_reader, header);
+    defer allocator.free(frame_infos);
+
+    var stdout_buf: [1024]u8 = undefined;
+    var out = std.fs.File.stdout().writer(&stdout_buf);
+    defer out.interface.flush() catch {};
+    try writeInfo(&out.interface, header, frame_infos);
+}
+
 fn reportInvalidQoi(path: []const u8, err: anyerror) !void {
     const reason = describeQoiError(err);
     try printStderr("error: invalid QOI input '{s}': {s}\n", .{ path, reason });
@@ -315,6 +345,76 @@ fn readExact(reader: anytype, buf: []u8) !void {
     if (amount != buf.len) return CliError.InvalidQoi;
 }
 
+fn collectFrameMetadata(allocator: std.mem.Allocator, reader: anytype, header: qov.Header) ![]FrameInfo {
+    var infos = std.ArrayList(FrameInfo).empty;
+    errdefer infos.deinit(allocator);
+    var index: usize = 0;
+    var scratch: [4096]u8 = undefined;
+
+    while (true) {
+        if (header.frame_count != 0 and index >= header.frame_count) break;
+
+        const chunk_header = qov.readChunkHeader(reader, header.flags.frame_metadata) catch |err| switch (err) {
+            qov.QovError.UnexpectedEof => {
+                if (header.frame_count == 0) break;
+                return err;
+            },
+            else => return err,
+        };
+
+        try infos.append(allocator, .{
+            .index = index,
+            .chunk_type = chunk_header.chunk_type,
+            .payload_size = chunk_header.payload_size,
+            .frame_duration_us = chunk_header.frame_duration_us,
+        });
+
+        var remaining: usize = @intCast(chunk_header.payload_size);
+        while (remaining > 0) {
+            const to_read = @min(remaining, scratch.len);
+            try qov.readChunkPayload(reader, scratch[0..to_read]);
+            remaining -= to_read;
+        }
+
+        index += 1;
+    }
+
+    return try infos.toOwnedSlice(allocator);
+}
+
+fn writeInfo(writer: anytype, header: qov.Header, frame_infos: []const FrameInfo) !void {
+    try writer.print("Header:\n", .{});
+    try writer.print("  size: {d}x{d}\n", .{ header.width, header.height });
+    try writer.print("  fps: {d}/{d}\n", .{ header.fps_num, header.fps_den });
+    try writer.print("  colorspace: {s}\n", .{ @tagName(header.colorspace) });
+    try writer.print("  channels: {s}\n", .{ @tagName(header.channels) });
+    try writer.print("  flags: rgb_only={any}, frame_metadata={any}\n", .{ header.flags.rgb_only, header.flags.frame_metadata });
+    try writer.print("  gop_size: {d}\n", .{ header.gop_size });
+    try writer.print("  has_audio: {any}\n", .{ header.has_audio });
+    try writer.print("  audio_sample_rate: {d}\n", .{ header.audio_sample_rate });
+    try writer.print("  audio_channels: {d}\n", .{ header.audio_channels });
+    try writer.print("  frame_count: {d}\n", .{ header.frame_count });
+
+    try writer.print("Frames:\n", .{});
+    try writer.print("  count: {d}\n", .{ frame_infos.len });
+    if (!header.flags.frame_metadata) {
+        try writer.print("  frame_duration_us: disabled\n", .{});
+    }
+    for (frame_infos) |info| {
+        if (header.flags.frame_metadata) {
+            try writer.print(
+                "  [{d}] type={s} payload_bytes={d} duration_us={d}\n",
+                .{ info.index, @tagName(info.chunk_type), info.payload_size, info.frame_duration_us },
+            );
+        } else {
+            try writer.print(
+                "  [{d}] type={s} payload_bytes={d}\n",
+                .{ info.index, @tagName(info.chunk_type), info.payload_size },
+            );
+        }
+    }
+}
+
 test "qoi read/write roundtrip" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -356,5 +456,70 @@ test "cli frame size mismatch message includes sizes" {
     try std.testing.expectEqualStrings(
         "error: frame size mismatch for 'second.qoi': expected 10x12 (from 'first.qoi'), got 14x16\n",
         buffer.items,
+    );
+}
+
+test "cli info output includes frame metadata" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    const header = qov.Header{
+        .width = 2,
+        .height = 3,
+        .fps_num = 30,
+        .fps_den = 1,
+        .colorspace = .srgb,
+        .channels = .rgba,
+        .flags = .{ .frame_metadata = true },
+        .gop_size = 4,
+        .has_audio = false,
+        .audio_sample_rate = 0,
+        .audio_channels = 0,
+        .frame_count = 2,
+    };
+
+    var writer = buffer.writer(std.testing.allocator);
+    try qov.writeHeader(&writer, header);
+    try qov.writeChunkHeader(&writer, .{
+        .chunk_type = .iframe,
+        .payload_size = 2,
+        .frame_duration_us = 10,
+    }, true);
+    try writer.writeAll(&[_]u8{ 0x01, 0x02 });
+    try qov.writeChunkHeader(&writer, .{
+        .chunk_type = .pframe,
+        .payload_size = 3,
+        .frame_duration_us = 20,
+    }, true);
+    try writer.writeAll(&[_]u8{ 0x03, 0x04, 0x05 });
+
+    var stream = std.io.fixedBufferStream(buffer.items);
+    var stream_reader = stream.reader();
+    const parsed_header = try qov.readHeader(&stream_reader);
+    const frame_infos = try collectFrameMetadata(std.testing.allocator, &stream_reader, parsed_header);
+    defer std.testing.allocator.free(frame_infos);
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(std.testing.allocator);
+    var out_writer = out.writer(std.testing.allocator);
+    try writeInfo(&out_writer, parsed_header, frame_infos);
+
+    try std.testing.expectEqualStrings(
+        "Header:\n" ++
+            "  size: 2x3\n" ++
+            "  fps: 30/1\n" ++
+            "  colorspace: srgb\n" ++
+            "  channels: rgba\n" ++
+            "  flags: rgb_only=false, frame_metadata=true\n" ++
+            "  gop_size: 4\n" ++
+            "  has_audio: false\n" ++
+            "  audio_sample_rate: 0\n" ++
+            "  audio_channels: 0\n" ++
+            "  frame_count: 2\n" ++
+            "Frames:\n" ++
+            "  count: 2\n" ++
+            "  [0] type=iframe payload_bytes=2 duration_us=10\n" ++
+            "  [1] type=pframe payload_bytes=3 duration_us=20\n",
+        out.items,
     );
 }
