@@ -527,3 +527,45 @@ test "truncated streams error during decode" {
     var reader = stream.reader();
     try std.testing.expectError(qov.QovError.UnexpectedEof, qov.decodeStream(std.testing.allocator, &reader, &out_frames));
 }
+
+test "in-memory example encode/decode roundtrip" {
+    const header = qov.Header{
+        .width = 2,
+        .height = 1,
+        .fps_num = 30,
+        .fps_den = 1,
+        .colorspace = .srgb,
+        .channels = .rgba,
+        .gop_size = 2,
+        .has_audio = false,
+        .audio_sample_rate = 0,
+        .audio_channels = 0,
+        .frame_count = 2,
+    };
+
+    const frame0 = [_]u8{
+        0x12, 0x34, 0x56, 0xFF,
+        0xAA, 0xBB, 0xCC, 0xFF,
+    };
+    const frame1 = [_]u8{
+        0xDE, 0xAD, 0xBE, 0xEF,
+        0x00, 0x11, 0x22, 0xFF,
+    };
+    const frames = [_][]const u8{ &frame0, &frame1 };
+
+    var encoded = std.ArrayList(u8).empty;
+    defer encoded.deinit(std.testing.allocator);
+    var writer = encoded.writer(std.testing.allocator);
+    try qov.encodeStream(std.testing.allocator, &writer, header, &frames, null);
+
+    var out0: [frame0.len]u8 = undefined;
+    var out1: [frame1.len]u8 = undefined;
+    var out_frames = [_][]u8{ &out0, &out1 };
+    var stream = std.io.fixedBufferStream(encoded.items);
+    var reader = stream.reader();
+    _ = try qov.decodeStream(std.testing.allocator, &reader, &out_frames);
+
+    try std.testing.expectEqualSlices(u8, &frame0, &out0);
+    try std.testing.expectEqualSlices(u8, &frame1, &out1);
+    try std.testing.expectEqual(encoded.items.len, stream.pos);
+}
