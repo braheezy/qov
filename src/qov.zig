@@ -124,6 +124,10 @@ pub const Header = struct {
 pub const EncodeOptions = struct {
     parallel: bool = false,
     max_threads: ?usize = null,
+    /// Optional audio chunk payloads to interleave with video frames.
+    /// Mapping: one audio chunk is written after each video frame, then any
+    /// remaining audio chunks are appended at the end of the stream.
+    audio_chunks: ?[]const []const u8 = null,
 };
 
 /// Chunk header describing the payload and optional duration metadata.
@@ -506,7 +510,29 @@ fn encodeFrameJob(ctx: *EncodeJobContext, index: usize) void {
     ctx.payload_sizes[index] = stream.pos;
 }
 
-fn encodeStreamSequential(allocator: std.mem.Allocator, writer: anytype, header: Header, frames: []const []const u8, frame_durations_us: ?[]const u32, default_frame_duration_us: u32) (QovError || std.mem.Allocator.Error || writerErrorType(@TypeOf(writer)))!void {
+const AudioChunkState = struct {
+    chunks: []const []const u8,
+    index: usize = 0,
+};
+
+fn writeNextAudioChunk(writer: anytype, header: Header, audio_state: ?*AudioChunkState) (QovError || writerErrorType(@TypeOf(writer)))!void {
+    if (audio_state) |state| {
+        if (state.index < state.chunks.len) {
+            try writeAudioChunk(writer, header, state.chunks[state.index]);
+            state.index += 1;
+        }
+    }
+}
+
+fn writeRemainingAudioChunks(writer: anytype, header: Header, audio_state: ?*AudioChunkState) (QovError || writerErrorType(@TypeOf(writer)))!void {
+    if (audio_state) |state| {
+        while (state.index < state.chunks.len) : (state.index += 1) {
+            try writeAudioChunk(writer, header, state.chunks[state.index]);
+        }
+    }
+}
+
+fn encodeStreamSequential(allocator: std.mem.Allocator, writer: anytype, header: Header, frames: []const []const u8, frame_durations_us: ?[]const u32, default_frame_duration_us: u32, audio_state: ?*AudioChunkState) (QovError || std.mem.Allocator.Error || writerErrorType(@TypeOf(writer)))!void {
     var payload = std.ArrayList(u8).empty;
     defer payload.deinit(allocator);
 
@@ -578,7 +604,10 @@ fn encodeStreamSequential(allocator: std.mem.Allocator, writer: anytype, header:
             .frame_duration_us = frame_duration_us,
         }, has_frame_metadata);
         try writeChunkPayload(writer, payload.items);
+        try writeNextAudioChunk(writer, header, audio_state);
     }
+
+    try writeRemainingAudioChunks(writer, header, audio_state);
 }
 
 /// Encodes a full stream with default options.
@@ -589,6 +618,14 @@ pub fn encodeStream(allocator: std.mem.Allocator, writer: anytype, header: Heade
 /// Encodes a stream with configurable options, including parallel preprocessing.
 pub fn encodeStreamWithOptions(allocator: std.mem.Allocator, writer: anytype, header: Header, frames: []const []const u8, frame_durations_us: ?[]const u32, options: EncodeOptions) (QovError || std.mem.Allocator.Error || writerErrorType(@TypeOf(writer)))!void {
     try validateHeader(header);
+
+    if (options.audio_chunks) |audio_chunks| {
+        if (!header.has_audio) return QovError.InvalidHeader;
+        for (audio_chunks) |payload| {
+            if (payload.len > std.math.maxInt(u32)) return QovError.InvalidChunk;
+            try validateAudioChunkPayload(header, payload);
+        }
+    }
 
     if (header.frame_count != 0 and header.frame_count != frames.len) return QovError.InvalidHeader;
     if (header.flags.frame_metadata) {
@@ -613,6 +650,9 @@ pub fn encodeStreamWithOptions(allocator: std.mem.Allocator, writer: anytype, he
         if (duration == 0 or duration > std.math.maxInt(u32)) return QovError.InvalidHeader;
         break :blk @intCast(duration);
     } else 0;
+
+    var audio_state_storage: ?AudioChunkState = if (options.audio_chunks) |audio_chunks| .{ .chunks = audio_chunks } else null;
+    const audio_state: ?*AudioChunkState = if (audio_state_storage) |*state| state else null;
 
     if (options.parallel and frames.len > 1 and !builtin.single_threaded) {
         var pool: std.Thread.Pool = undefined;
@@ -713,12 +753,14 @@ pub fn encodeStreamWithOptions(allocator: std.mem.Allocator, writer: anytype, he
                 .frame_duration_us = frame_duration_us,
             }, has_frame_metadata);
             try writeChunkPayload(writer, payload_buffers[index][0..payload_size]);
+            try writeNextAudioChunk(writer, header, audio_state);
         }
+        try writeRemainingAudioChunks(writer, header, audio_state);
         } else |_| {
-            try encodeStreamSequential(allocator, writer, header, frames, frame_durations_us, default_frame_duration_us);
+            try encodeStreamSequential(allocator, writer, header, frames, frame_durations_us, default_frame_duration_us, audio_state);
         }
     } else {
-        try encodeStreamSequential(allocator, writer, header, frames, frame_durations_us, default_frame_duration_us);
+        try encodeStreamSequential(allocator, writer, header, frames, frame_durations_us, default_frame_duration_us, audio_state);
     }
 }
 
@@ -1383,7 +1425,7 @@ test "header read/write roundtrip" {
     try writeHeader(&stream_writer, header);
 
     stream.pos = 0;
-    var stream_reader = stream.reader();
+    const stream_reader = stream.reader();
     const decoded = try readHeader(&stream_reader);
 
     try std.testing.expectEqual(header.width, decoded.width);
@@ -1416,7 +1458,7 @@ test "chunk header and payload read/write roundtrip" {
     try writeChunkPayload(&stream_writer, payload);
 
     stream.pos = 0;
-    var stream_reader = stream.reader();
+    const stream_reader = stream.reader();
     const decoded_header = try readChunkHeader(&stream_reader, false);
 
     var decoded_payload: [payload.len]u8 = undefined;
@@ -1616,6 +1658,76 @@ test "stream encode/decode roundtrip parallel" {
     try std.testing.expectEqual(header.frame_count, decoded_header.frame_count);
     try std.testing.expectEqualSlices(u8, &frame0, out_frames[0]);
     try std.testing.expectEqualSlices(u8, &frame1, out_frames[1]);
+    try std.testing.expectEqual(encoded.items.len, stream.pos);
+}
+
+test "stream encode interleaves audio chunks" {
+    var file = try std.fs.cwd().openFile("arcade.qoa", .{});
+    defer file.close();
+
+    var file_header: [8]u8 = undefined;
+    _ = try file.readAll(&file_header);
+
+    var frame_header_bytes: [8]u8 = undefined;
+    const header_len = try file.readAll(&frame_header_bytes);
+    try std.testing.expectEqual(@as(usize, 8), header_len);
+
+    const frame_header = try qoa_stream.parseFrameHeader(&frame_header_bytes);
+    const frame_size: usize = @intCast(frame_header.frame_size);
+    var frame_payload = try std.testing.allocator.alloc(u8, frame_size);
+    defer std.testing.allocator.free(frame_payload);
+
+    std.mem.copyForwards(u8, frame_payload[0..8], &frame_header_bytes);
+    const payload_read = try file.readAll(frame_payload[8..frame_size]);
+    try std.testing.expectEqual(frame_size - 8, payload_read);
+
+    const header = Header{
+        .width = 1,
+        .height = 1,
+        .fps_num = 30,
+        .fps_den = 1,
+        .colorspace = .srgb,
+        .channels = .rgba,
+        .gop_size = 2,
+        .has_audio = true,
+        .audio_sample_rate = frame_header.sample_rate,
+        .audio_channels = frame_header.channels,
+        .audio_frames_per_chunk = 1,
+        .frame_count = 2,
+    };
+
+    const frame0 = [_]u8{ 10, 20, 30, 255 };
+    const frame1 = [_]u8{ 12, 22, 32, 255 };
+    const frames = [_][]const u8{ &frame0, &frame1 };
+
+    const audio_chunks = [_][]const u8{ frame_payload, frame_payload, frame_payload };
+
+    var encoded = std.ArrayList(u8).empty;
+    defer encoded.deinit(std.testing.allocator);
+
+    var encoded_writer = encoded.writer(std.testing.allocator);
+    try encodeStreamWithOptions(std.testing.allocator, &encoded_writer, header, &frames, null, .{ .audio_chunks = &audio_chunks });
+
+    var stream = std.io.fixedBufferStream(encoded.items);
+    var stream_reader = stream.reader();
+    const decoded_header = try readHeader(&stream_reader);
+    try std.testing.expect(decoded_header.has_audio);
+
+    const expected_types = [_]ChunkType{ .iframe, .audio, .pframe, .audio, .audio };
+    for (expected_types) |expected_type| {
+        const chunk_header = try readChunkHeader(&stream_reader, decoded_header.flags.frame_metadata);
+        try std.testing.expectEqual(expected_type, chunk_header.chunk_type);
+
+        const payload_size: usize = @intCast(chunk_header.payload_size);
+        const payload = try std.testing.allocator.alloc(u8, payload_size);
+        defer std.testing.allocator.free(payload);
+        try readChunkPayload(&stream_reader, payload);
+
+        if (expected_type == .audio) {
+            try validateAudioChunkPayload(decoded_header, payload);
+        }
+    }
+
     try std.testing.expectEqual(encoded.items.len, stream.pos);
 }
 
