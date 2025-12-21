@@ -10,7 +10,8 @@ This phase tightens streaming ergonomics, improves error handling, and expands t
   - Added a dedicated `FrameSizeMismatch` error surfaced by stream encode/decode checks and covered by a new stream mismatch test.
 - [x] Add tests for RUN/TRUN boundary lengths, chunk payload sizing, and end marker detection in `src/qov_test.zig`.
   - Added I-frame RUN and P-frame TRUN boundary coverage, verified chunk payload sizing against encoded payloads, and asserted end marker detection failures in `src/qov_test.zig`.
-- [ ] Add negative tests for malformed headers, unknown chunk types, and truncated streams.
+- [x] Add negative tests for malformed headers, unknown chunk types, and truncated streams.
+  - Added malformed header coverage (bad magic/version/fields, truncated header), unknown chunk type parsing failure, and truncated stream decode error tests in `src/qov_test.zig`.
 - [ ] Add frame-count streaming behavior: support `frame_count = 0` (unknown) and ensure decode ends on EOF.
 - [ ] Improve CLI validation and error messages for mismatched frame sizes or invalid QOI inputs.
 - [ ] Benchmark a small multi-frame encode/decode in tests to guard performance regressions.

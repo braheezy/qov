@@ -297,3 +297,109 @@ test "frame end marker detection" {
     var pframe_reader = pframe_stream.reader();
     try std.testing.expectError(qov.QovError.InvalidChunk, qov.decodePFrame(&pframe_reader, &pframe_out, &pixels));
 }
+
+test "malformed headers are rejected" {
+    const header = qov.Header{
+        .width = 2,
+        .height = 2,
+        .fps_num = 30,
+        .fps_den = 1,
+        .colorspace = .srgb,
+        .channels = .rgba,
+        .gop_size = 1,
+        .has_audio = false,
+        .audio_sample_rate = 0,
+        .audio_channels = 0,
+        .frame_count = 1,
+    };
+
+    var buffer: [qov.header_size]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&buffer);
+    var writer = stream.writer();
+    try qov.writeHeader(&writer, header);
+
+    buffer[0] = 'x';
+    stream.pos = 0;
+    var reader = stream.reader();
+    try std.testing.expectError(qov.QovError.InvalidMagic, qov.readHeader(&reader));
+
+    @memcpy(buffer[0..4], &qov.magic);
+    buffer[4] = 99;
+    stream.pos = 0;
+    reader = stream.reader();
+    try std.testing.expectError(qov.QovError.UnsupportedVersion, qov.readHeader(&reader));
+
+    @memcpy(buffer[0..4], &qov.magic);
+    buffer[4] = qov.version;
+    @memset(buffer[11..13], 0);
+    stream.pos = 0;
+    reader = stream.reader();
+    try std.testing.expectError(qov.QovError.InvalidHeader, qov.readHeader(&reader));
+
+    const truncated = buffer[0..10];
+    var short_stream = std.io.fixedBufferStream(truncated);
+    var short_reader = short_stream.reader();
+    try std.testing.expectError(qov.QovError.UnexpectedEof, qov.readHeader(&short_reader));
+}
+
+test "unknown chunk types fail decoding" {
+    const header = qov.Header{
+        .width = 1,
+        .height = 1,
+        .fps_num = 30,
+        .fps_den = 1,
+        .colorspace = .srgb,
+        .channels = .rgba,
+        .gop_size = 1,
+        .has_audio = false,
+        .audio_sample_rate = 0,
+        .audio_channels = 0,
+        .frame_count = 1,
+    };
+
+    var buffer: [qov.header_size + qov.chunk_header_size]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&buffer);
+    var writer = stream.writer();
+    try qov.writeHeader(&writer, header);
+
+    buffer[qov.header_size] = 9;
+    std.mem.writeInt(u32, buffer[qov.header_size + 1 .. qov.header_size + 5], 0, .big);
+
+    stream.pos = 0;
+    var reader = stream.reader();
+    _ = try qov.readHeader(&reader);
+    try std.testing.expectError(qov.QovError.InvalidChunk, qov.readChunkHeader(&reader));
+}
+
+test "truncated streams error during decode" {
+    const header = qov.Header{
+        .width = 1,
+        .height = 1,
+        .fps_num = 30,
+        .fps_den = 1,
+        .colorspace = .srgb,
+        .channels = .rgba,
+        .gop_size = 1,
+        .has_audio = false,
+        .audio_sample_rate = 0,
+        .audio_channels = 0,
+        .frame_count = 1,
+    };
+
+    const frame = [_]u8{
+        1, 2, 3, 255,
+    };
+
+    const frames = [_][]const u8{ &frame };
+    var encoded = std.ArrayList(u8).empty;
+    defer encoded.deinit(std.testing.allocator);
+    var writer = encoded.writer(std.testing.allocator);
+    try qov.encodeStream(std.testing.allocator, &writer, header, &frames);
+
+    const truncated = encoded.items[0 .. encoded.items.len - 1];
+    var out_frame: [frame.len]u8 = undefined;
+    var out_frames = [_][]u8{ &out_frame };
+    var stream = std.io.fixedBufferStream(truncated);
+    var reader = stream.reader();
+    try std.testing.expectError(qov.QovError.UnexpectedEof, qov.decodeStream(std.testing.allocator, &reader, &out_frames));
+}
