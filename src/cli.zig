@@ -15,15 +15,25 @@ const CliError = error{
     InvalidArgs,
     InvalidQoi,
     UnsupportedQoi,
+    FrameSizeMismatch,
     InvalidQov,
     StreamingNotSupported,
 };
 
-pub fn main() !void {
+pub fn main() void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    runMain(allocator) catch |err| {
+        if (!isReportedError(err)) {
+            printStderr("error: {s}\n", .{@errorName(err)}) catch {};
+        }
+        std.process.exit(1);
+    };
+}
+
+fn runMain(allocator: std.mem.Allocator) !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
@@ -51,15 +61,27 @@ pub fn main() !void {
     }
 }
 
-fn printUsage() !void {
-    var stderr_buf: [256]u8 = undefined;
+fn printStderr(comptime fmt: []const u8, args: anytype) !void {
+    var stderr_buf: [512]u8 = undefined;
     var err = std.fs.File.stderr().writer(&stderr_buf);
     defer err.interface.flush() catch {};
-    try err.interface.writeAll(
+    try err.interface.print(fmt, args);
+}
+
+fn printUsage() !void {
+    try printStderr(
         "Usage:\n" ++
             "  qov encode <output.qov> <input1.qoi> [input2.qoi ...]\n" ++
             "  qov decode <input.qov> <output_dir>\n",
+        .{},
     );
+}
+
+fn isReportedError(err: anyerror) bool {
+    return err == CliError.InvalidArgs or
+        err == CliError.InvalidQoi or
+        err == CliError.UnsupportedQoi or
+        err == CliError.FrameSizeMismatch;
 }
 
 fn runEncode(allocator: std.mem.Allocator, output_path: []const u8, input_paths: []const []const u8) !void {
@@ -71,20 +93,27 @@ fn runEncode(allocator: std.mem.Allocator, output_path: []const u8, input_paths:
 
     var width: u32 = 0;
     var height: u32 = 0;
+    var base_path: []const u8 = "";
 
     for (input_paths) |path| {
         const file_bytes = try std.fs.cwd().readFileAlloc(allocator, path, std.math.maxInt(usize));
         defer allocator.free(file_bytes);
 
-        const decoded = try decodeQoiToRgba(allocator, file_bytes);
+        const decoded = decodeQoiToRgba(allocator, file_bytes) catch |err| {
+            try reportInvalidQoi(path, err);
+            if (err == CliError.UnsupportedQoi) return CliError.UnsupportedQoi;
+            return CliError.InvalidQoi;
+        };
         errdefer allocator.free(decoded.pixels);
 
         if (width == 0 and height == 0) {
             width = decoded.header.width;
             height = decoded.header.height;
+            base_path = path;
         } else if (decoded.header.width != width or decoded.header.height != height) {
             allocator.free(decoded.pixels);
-            return CliError.InvalidQoi;
+            try reportFrameSizeMismatch(base_path, path, width, height, decoded.header.width, decoded.header.height);
+            return CliError.FrameSizeMismatch;
         }
 
         try frames.append(allocator, decoded.pixels);
@@ -160,6 +189,42 @@ fn runDecode(allocator: std.mem.Allocator, input_path: []const u8, output_dir: [
     }
 }
 
+fn reportInvalidQoi(path: []const u8, err: anyerror) !void {
+    const reason = describeQoiError(err);
+    try printStderr("error: invalid QOI input '{s}': {s}\n", .{ path, reason });
+}
+
+fn reportFrameSizeMismatch(base_path: []const u8, path: []const u8, expected_width: u32, expected_height: u32, actual_width: u32, actual_height: u32) !void {
+    var stderr_buf: [512]u8 = undefined;
+    var err = std.fs.File.stderr().writer(&stderr_buf);
+    defer err.interface.flush() catch {};
+    try writeFrameSizeMismatch(&err.interface, base_path, path, expected_width, expected_height, actual_width, actual_height);
+}
+
+fn writeFrameSizeMismatch(writer: anytype, base_path: []const u8, path: []const u8, expected_width: u32, expected_height: u32, actual_width: u32, actual_height: u32) !void {
+    if (base_path.len == 0) {
+        try writer.print(
+            "error: frame size mismatch for '{s}': expected {d}x{d}, got {d}x{d}\n",
+            .{ path, expected_width, expected_height, actual_width, actual_height },
+        );
+        return;
+    }
+    try writer.print(
+        "error: frame size mismatch for '{s}': expected {d}x{d} (from '{s}'), got {d}x{d}\n",
+        .{ path, expected_width, expected_height, base_path, actual_width, actual_height },
+    );
+}
+
+fn describeQoiError(err: anyerror) []const u8 {
+    return switch (err) {
+        CliError.InvalidQoi => "invalid QOI header",
+        CliError.UnsupportedQoi => "unsupported QOI channels/colorspace",
+        qov.QovError.InvalidChunk => "invalid QOI data chunk",
+        qov.QovError.UnexpectedEof => "unexpected EOF while reading QOI data",
+        else => "invalid QOI data",
+    };
+}
+
 fn decodeQoiToRgba(allocator: std.mem.Allocator, file_bytes: []const u8) !struct { header: QoiHeader, pixels: []u8 } {
     var stream = std.io.fixedBufferStream(file_bytes);
     var stream_reader = stream.reader();
@@ -175,6 +240,7 @@ fn decodeQoiToRgba(allocator: std.mem.Allocator, file_bytes: []const u8) !struct
     errdefer allocator.free(pixels);
 
     try qov.decodeIFrame(&stream_reader, pixels);
+    if (stream.pos != file_bytes.len) return CliError.InvalidQoi;
 
     return .{ .header = header, .pixels = pixels };
 }
@@ -245,4 +311,23 @@ test "qoi read/write roundtrip" {
     try std.testing.expectEqual(@as(u32, 1), decoded.header.height);
     try std.testing.expectEqual(@as(u8, 4), decoded.header.channels);
     try std.testing.expectEqualSlices(u8, &pixels, decoded.pixels);
+}
+
+test "cli QOI error descriptions" {
+    try std.testing.expectEqualStrings("invalid QOI header", describeQoiError(CliError.InvalidQoi));
+    try std.testing.expectEqualStrings("unsupported QOI channels/colorspace", describeQoiError(CliError.UnsupportedQoi));
+    try std.testing.expectEqualStrings("invalid QOI data chunk", describeQoiError(qov.QovError.InvalidChunk));
+    try std.testing.expectEqualStrings("unexpected EOF while reading QOI data", describeQoiError(qov.QovError.UnexpectedEof));
+}
+
+test "cli frame size mismatch message includes sizes" {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    var writer = buffer.writer(std.testing.allocator);
+    try writeFrameSizeMismatch(&writer, "first.qoi", "second.qoi", 10, 12, 14, 16);
+    try std.testing.expectEqualStrings(
+        "error: frame size mismatch for 'second.qoi': expected 10x12 (from 'first.qoi'), got 14x16\n",
+        buffer.items,
+    );
 }

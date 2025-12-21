@@ -13,5 +13,6 @@ This phase tightens streaming ergonomics, improves error handling, and expands t
 - [x] Add negative tests for malformed headers, unknown chunk types, and truncated streams.
   - Added malformed header coverage (bad magic/version/fields, truncated header), unknown chunk type parsing failure, and truncated stream decode error tests in `src/qov_test.zig`.
 - [x] Add frame-count streaming behavior: support `frame_count = 0` (unknown) and ensure decode ends on EOF.
-- [ ] Improve CLI validation and error messages for mismatched frame sizes or invalid QOI inputs.
+- [x] Improve CLI validation and error messages for mismatched frame sizes or invalid QOI inputs.
+  - Added CLI stderr messaging for QOI decode failures and frame size mismatches, plus small helper tests for message formatting in `src/cli.zig`.
 - [ ] Benchmark a small multi-frame encode/decode in tests to guard performance regressions.
