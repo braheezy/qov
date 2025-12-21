@@ -105,7 +105,7 @@ test "qoi vector stream roundtrip" {
     defer encoded.deinit(allocator);
 
     var encoded_writer = encoded.writer(allocator);
-    try qov.encodeStream(allocator, &encoded_writer, header, frames.items);
+    try qov.encodeStream(allocator, &encoded_writer, header, frames.items, null);
 
     const out_frames = try allocator.alloc([]u8, frames.items.len);
     defer {
@@ -177,7 +177,7 @@ test "stream encode/decode benchmark small frames" {
     var encoded_writer = encoded.writer(std.testing.allocator);
 
     var timer = try std.time.Timer.start();
-    try qov.encodeStream(std.testing.allocator, &encoded_writer, header, frames);
+    try qov.encodeStream(std.testing.allocator, &encoded_writer, header, frames, null);
 
     const out_frame_bytes = qov.headerFrameBytes(header);
     const out_frames = try std.testing.allocator.alloc([]u8, frame_count);
@@ -312,13 +312,13 @@ test "stream chunk payload sizes match encoded payloads" {
     var encoded = std.ArrayList(u8).empty;
     defer encoded.deinit(std.testing.allocator);
     var encoded_writer = encoded.writer(std.testing.allocator);
-    try qov.encodeStream(std.testing.allocator, &encoded_writer, header, &frames);
+    try qov.encodeStream(std.testing.allocator, &encoded_writer, header, &frames, null);
 
     var stream = std.io.fixedBufferStream(encoded.items);
     var reader = stream.reader();
     _ = try qov.readHeader(&reader);
 
-    const chunk0 = try qov.readChunkHeader(&reader);
+    const chunk0 = try qov.readChunkHeader(&reader, header.flags.frame_metadata);
     const chunk0_len: usize = @intCast(chunk0.payload_size);
     try std.testing.expectEqual(@as(u32, @intCast(iframe_payload.items.len)), chunk0.payload_size);
     const chunk0_payload = try std.testing.allocator.alloc(u8, chunk0_len);
@@ -326,7 +326,7 @@ test "stream chunk payload sizes match encoded payloads" {
     try qov.readChunkPayload(&reader, chunk0_payload);
     try std.testing.expectEqual(iframe_payload.items.len, chunk0_payload.len);
 
-    const chunk1 = try qov.readChunkHeader(&reader);
+    const chunk1 = try qov.readChunkHeader(&reader, header.flags.frame_metadata);
     const chunk1_len: usize = @intCast(chunk1.payload_size);
     try std.testing.expectEqual(@as(u32, @intCast(pframe_payload.items.len)), chunk1.payload_size);
     const chunk1_payload = try std.testing.allocator.alloc(u8, chunk1_len);
@@ -366,7 +366,7 @@ test "stream decode stops on EOF when frame count unknown" {
     defer encoded.deinit(std.testing.allocator);
 
     var encoded_writer = encoded.writer(std.testing.allocator);
-    try qov.encodeStream(std.testing.allocator, &encoded_writer, header, &frames);
+    try qov.encodeStream(std.testing.allocator, &encoded_writer, header, &frames, null);
 
     const frame_bytes = qov.headerFrameBytes(header);
     var out_frames = try std.testing.allocator.alloc([]u8, 4);
@@ -492,7 +492,7 @@ test "unknown chunk types fail decoding" {
     stream.pos = 0;
     var reader = stream.reader();
     _ = try qov.readHeader(&reader);
-    try std.testing.expectError(qov.QovError.InvalidChunk, qov.readChunkHeader(&reader));
+    try std.testing.expectError(qov.QovError.InvalidChunk, qov.readChunkHeader(&reader, false));
 }
 
 test "truncated streams error during decode" {
@@ -518,7 +518,7 @@ test "truncated streams error during decode" {
     var encoded = std.ArrayList(u8).empty;
     defer encoded.deinit(std.testing.allocator);
     var writer = encoded.writer(std.testing.allocator);
-    try qov.encodeStream(std.testing.allocator, &writer, header, &frames);
+    try qov.encodeStream(std.testing.allocator, &writer, header, &frames, null);
 
     const truncated = encoded.items[0 .. encoded.items.len - 1];
     var out_frame: [frame.len]u8 = undefined;

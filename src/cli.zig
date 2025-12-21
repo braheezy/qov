@@ -142,7 +142,7 @@ fn runEncode(allocator: std.mem.Allocator, output_path: []const u8, input_paths:
 
     var out_buf: [8192]u8 = undefined;
     var out_writer = out_file.writer(&out_buf);
-    try qov.encodeStream(allocator, &out_writer.interface, header, frames.items);
+    try qov.encodeStream(allocator, &out_writer.interface, header, frames.items, null);
     try out_writer.interface.flush();
 }
 

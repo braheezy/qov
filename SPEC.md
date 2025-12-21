@@ -79,7 +79,7 @@ Position in the landscape:
 | 17     | 3    | u24 BE  | Audio sample rate |
 | 20     | 1    | u8      | Audio channels |
 | 21     | 4    | u32 BE  | Total frame count (0=streaming) |
-| 25     | 1    | u8      | Flags (bit 0 = RGB-only, alpha implicit 255) |
+| 25     | 1    | u8      | Flags (bit 0 = RGB-only, alpha implicit 255; bit 1 = per-frame duration metadata in chunk headers) |
 | 26     | 6    | -       | Reserved (set to 0) |
 
 ### Chunk Header (5 bytes)
@@ -88,6 +88,12 @@ Position in the landscape:
 |--------|------|--------|-------------|
 | 0      | 1    | u8     | Chunk type: 0=I-frame, 1=P-frame, 2=Audio |
 | 1      | 4    | u32 BE | Payload size in bytes |
+
+If header flag bit 1 is set, each chunk header is extended with an extra 4 bytes:
+
+| Offset | Size | Type   | Description |
+|--------|------|--------|-------------|
+| 5      | 4    | u32 BE | Frame duration in microseconds |
 
 ### Video Frame Payload
 
