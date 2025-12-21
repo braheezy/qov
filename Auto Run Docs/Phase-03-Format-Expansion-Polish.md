@@ -1,0 +1,12 @@
+# Phase 03: Format Expansion + Polish
+
+This phase expands codec capabilities, improves interoperability, and adds developer quality-of-life improvements.
+
+## Tasks
+
+- [x] Add optional RGB-only support (treat alpha as 255) with explicit flags in header. (Added header flag, RGB frame handling in codec/CLI, and tests.)
+- [ ] Add frame metadata support (timestamps or frame durations) in chunk headers.
+- [ ] Implement optional parallel encode of frames (per-frame preprocessing) while preserving stream order.
+- [ ] Add a `qov info` CLI subcommand to print header and frame metadata.
+- [ ] Add doc comments and usage examples to `src/qov.zig` and `src/cli.zig` for API clarity.
+- [ ] Add a small sample project in `examples/` demonstrating in-memory encode/decode.

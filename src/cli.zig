@@ -175,6 +175,14 @@ fn runDecode(allocator: std.mem.Allocator, input_path: []const u8, output_dir: [
 
     try std.fs.cwd().makePath(output_dir);
 
+    const rgb_only = qov.isRgbOnly(header);
+    var rgba_frame: ?[]u8 = null;
+    defer if (rgba_frame) |buffer| allocator.free(buffer);
+    if (rgb_only) {
+        const rgba_bytes = @as(usize, header.width) * @as(usize, header.height) * 4;
+        rgba_frame = try allocator.alloc(u8, rgba_bytes);
+    }
+
     for (frames, 0..) |frame, index| {
         const filename = try std.fmt.allocPrint(allocator, "{s}/frame_{d:0>6}.qoi", .{ output_dir, index });
         defer allocator.free(filename);
@@ -184,7 +192,12 @@ fn runDecode(allocator: std.mem.Allocator, input_path: []const u8, output_dir: [
 
         var out_buf: [4096]u8 = undefined;
         var out_writer = out_file.writer(&out_buf);
-        try writeQoi(&out_writer.interface, header.width, header.height, frame);
+        const output_frame = if (rgb_only) blk: {
+            const rgba = rgba_frame orelse return CliError.InvalidQov;
+            expandRgbToRgba(rgba, frame);
+            break :blk rgba;
+        } else frame;
+        try writeQoi(&out_writer.interface, header.width, header.height, output_frame);
         try out_writer.interface.flush();
     }
 }
@@ -271,6 +284,20 @@ fn writeQoi(writer: anytype, width: u16, height: u16, pixels: []const u8) !void 
 
     try writeQoiHeader(writer, header);
     try qov.encodeIFrame(writer, pixels);
+}
+
+fn expandRgbToRgba(dst: []u8, src: []const u8) void {
+    std.debug.assert(src.len % 3 == 0);
+    std.debug.assert(dst.len == (src.len / 3) * 4);
+    var src_index: usize = 0;
+    var dst_index: usize = 0;
+    while (src_index < src.len) : (src_index += 3) {
+        dst[dst_index] = src[src_index];
+        dst[dst_index + 1] = src[src_index + 1];
+        dst[dst_index + 2] = src[src_index + 2];
+        dst[dst_index + 3] = 0xFF;
+        dst_index += 4;
+    }
 }
 
 fn writeQoiHeader(writer: anytype, header: QoiHeader) !void {

@@ -20,6 +20,7 @@ pub const version: u8 = 1;
 pub const header_size: usize = 32;
 pub const chunk_header_size: usize = 5;
 pub const end_marker = [8]u8{ 0, 0, 0, 0, 0, 0, 0, 1 };
+pub const header_flag_rgb_only: u8 = 1 << 0;
 
 pub const Colorspace = enum(u8) {
     srgb = 0,
@@ -29,6 +30,11 @@ pub const Colorspace = enum(u8) {
 pub const Channels = enum(u8) {
     rgb = 3,
     rgba = 4,
+};
+
+pub const HeaderFlags = packed struct(u8) {
+    rgb_only: bool = false,
+    _reserved: u7 = 0,
 };
 
 pub const ChunkType = enum(u8) {
@@ -44,6 +50,7 @@ pub const Header = struct {
     fps_den: u16,
     colorspace: Colorspace,
     channels: Channels,
+    flags: HeaderFlags = .{},
     gop_size: u8,
     has_audio: bool,
     audio_sample_rate: u32,
@@ -76,16 +83,26 @@ pub fn isRgba(header: Header) bool {
     return header.channels == .rgba;
 }
 
+pub fn isRgbOnly(header: Header) bool {
+    return header.flags.rgb_only;
+}
+
 pub fn headerFramePixels(header: Header) usize {
     return @as(usize, header.width) * @as(usize, header.height);
 }
 
 pub fn headerFrameBytes(header: Header) usize {
-    return headerFramePixels(header) * 4;
+    const bytes_per_pixel: usize = if (header.flags.rgb_only) 3 else 4;
+    return headerFramePixels(header) * bytes_per_pixel;
 }
 
 pub fn validateHeader(header: Header) QovError!void {
-    if (header.channels != .rgba) return QovError.UnsupportedChannels;
+    if (header.flags._reserved != 0) return QovError.InvalidHeader;
+    if (header.flags.rgb_only) {
+        if (header.channels != .rgb) return QovError.InvalidHeader;
+    } else {
+        if (header.channels != .rgba) return QovError.UnsupportedChannels;
+    }
     if (header.has_audio) return QovError.UnsupportedAudio;
     if (header.fps_den == 0) return QovError.InvalidHeader;
     if (header.width == 0 or header.height == 0) return QovError.InvalidHeader;
@@ -153,6 +170,7 @@ pub fn readHeader(reader: anytype) (QovError || readerErrorType(@TypeOf(reader))
         .fps_den = std.mem.readInt(u16, buf[11..13], .big),
         .colorspace = try colorspaceFromByte(buf[13]),
         .channels = try channelsFromByte(buf[14]),
+        .flags = @bitCast(buf[25]),
         .gop_size = buf[15],
         .has_audio = switch (buf[16]) {
             0 => false,
@@ -191,6 +209,7 @@ pub fn writeHeader(writer: anytype, header: Header) (QovError || writerErrorType
     buf[19] = @truncate(header.audio_sample_rate);
     buf[20] = header.audio_channels;
     std.mem.writeInt(u32, buf[21..25], header.frame_count, .big);
+    buf[25] = @bitCast(header.flags);
 
     try writer.writeAll(&buf);
 }
@@ -236,6 +255,24 @@ pub fn encodeStream(allocator: std.mem.Allocator, writer: anytype, header: Heade
     defer payload.deinit(allocator);
 
     var prev_pixels: ?[]const u8 = null;
+    const rgb_only = header.flags.rgb_only;
+    var rgba_curr: ?[]u8 = null;
+    var rgba_prev: ?[]u8 = null;
+    var rgba_a: ?[]u8 = null;
+    var rgba_b: ?[]u8 = null;
+    errdefer if (rgba_a) |buffer| allocator.free(buffer);
+    errdefer if (rgba_b) |buffer| allocator.free(buffer);
+    if (rgb_only) {
+        const rgba_bytes = headerFramePixels(header) * 4;
+        rgba_a = try allocator.alloc(u8, rgba_bytes);
+        rgba_b = try allocator.alloc(u8, rgba_bytes);
+        rgba_curr = rgba_a;
+        rgba_prev = rgba_b;
+    }
+    defer {
+        if (rgba_a) |buffer| allocator.free(buffer);
+        if (rgba_b) |buffer| allocator.free(buffer);
+    }
     const gop_size = header.gop_size;
 
     for (frames, 0..) |frame, index| {
@@ -243,13 +280,30 @@ pub fn encodeStream(allocator: std.mem.Allocator, writer: anytype, header: Heade
 
         const use_iframe = index == 0 or gop_size == 0 or (index % gop_size == 0);
 
-        if (use_iframe) {
-            var payload_writer = payload.writer(allocator);
-            try encodeIFrame(&payload_writer, frame);
+        if (rgb_only) {
+            const curr = rgba_curr orelse return QovError.InvalidChunk;
+            const prev = rgba_prev orelse return QovError.InvalidChunk;
+            expandRgbToRgba(curr, frame);
+            if (use_iframe) {
+                var payload_writer = payload.writer(allocator);
+                try encodeIFrame(&payload_writer, curr);
+            } else {
+                var payload_writer = payload.writer(allocator);
+                try encodePFrame(&payload_writer, curr, prev);
+            }
+            rgba_curr = prev;
+            rgba_prev = curr;
+            prev_pixels = rgba_prev;
         } else {
-            const prev = prev_pixels orelse return QovError.InvalidChunk;
-            var payload_writer = payload.writer(allocator);
-            try encodePFrame(&payload_writer, frame, prev);
+            if (use_iframe) {
+                var payload_writer = payload.writer(allocator);
+                try encodeIFrame(&payload_writer, frame);
+            } else {
+                const prev = prev_pixels orelse return QovError.InvalidChunk;
+                var payload_writer = payload.writer(allocator);
+                try encodePFrame(&payload_writer, frame, prev);
+            }
+            prev_pixels = frame;
         }
 
         if (payload.items.len > std.math.maxInt(u32)) return QovError.InvalidChunk;
@@ -259,8 +313,6 @@ pub fn encodeStream(allocator: std.mem.Allocator, writer: anytype, header: Heade
             .payload_size = @intCast(payload.items.len),
         });
         try writeChunkPayload(writer, payload.items);
-
-        prev_pixels = frame;
     }
 }
 
@@ -271,22 +323,38 @@ pub fn StreamDecoder(comptime ReaderType: type) type {
         header: Header,
         payload: std.ArrayList(u8),
         prev_pixels: ?[]u8 = null,
+        rgba_curr: ?[]u8 = null,
+        rgba_prev: ?[]u8 = null,
         frame_index: usize = 0,
 
         pub fn init(allocator: std.mem.Allocator, reader: ReaderType) (QovError || std.mem.Allocator.Error || readerErrorType(ReaderType))!@This() {
             const header = try readHeader(reader);
-            return .{
+            var decoder = @This(){
                 .allocator = allocator,
                 .reader = reader,
                 .header = header,
                 .payload = std.ArrayList(u8).empty,
                 .prev_pixels = null,
+                .rgba_curr = null,
+                .rgba_prev = null,
                 .frame_index = 0,
             };
+            if (header.flags.rgb_only) {
+                const rgba_bytes = headerFramePixels(header) * 4;
+                const buffer_a = try allocator.alloc(u8, rgba_bytes);
+                errdefer allocator.free(buffer_a);
+                const buffer_b = try allocator.alloc(u8, rgba_bytes);
+                errdefer allocator.free(buffer_b);
+                decoder.rgba_curr = buffer_a;
+                decoder.rgba_prev = buffer_b;
+            }
+            return decoder;
         }
 
         pub fn deinit(self: *@This()) void {
             self.payload.deinit(self.allocator);
+            if (self.rgba_curr) |buffer| self.allocator.free(buffer);
+            if (self.rgba_prev) |buffer| self.allocator.free(buffer);
         }
 
         pub fn nextFrame(self: *@This(), frame: []u8) (QovError || std.mem.Allocator.Error || readerErrorType(ReaderType))!bool {
@@ -312,13 +380,33 @@ pub fn StreamDecoder(comptime ReaderType: type) type {
 
             switch (chunk_header.chunk_type) {
                 .iframe => {
-                    try decodeIFrame(&stream_reader, frame);
-                    self.prev_pixels = frame;
+                    if (self.header.flags.rgb_only) {
+                        const curr = self.rgba_curr orelse return QovError.InvalidChunk;
+                        const prev = self.rgba_prev orelse return QovError.InvalidChunk;
+                        try decodeIFrame(&stream_reader, curr);
+                        stripRgbaToRgb(frame, curr);
+                        self.rgba_curr = prev;
+                        self.rgba_prev = curr;
+                        self.prev_pixels = self.rgba_prev;
+                    } else {
+                        try decodeIFrame(&stream_reader, frame);
+                        self.prev_pixels = frame;
+                    }
                 },
                 .pframe => {
                     const prev = self.prev_pixels orelse return QovError.InvalidChunk;
-                    try decodePFrame(&stream_reader, frame, prev);
-                    self.prev_pixels = frame;
+                    if (self.header.flags.rgb_only) {
+                        const curr = self.rgba_curr orelse return QovError.InvalidChunk;
+                        const prev_rgba = self.rgba_prev orelse return QovError.InvalidChunk;
+                        try decodePFrame(&stream_reader, curr, prev_rgba);
+                        stripRgbaToRgb(frame, curr);
+                        self.rgba_curr = prev_rgba;
+                        self.rgba_prev = curr;
+                        self.prev_pixels = self.rgba_prev;
+                    } else {
+                        try decodePFrame(&stream_reader, frame, prev);
+                        self.prev_pixels = frame;
+                    }
                 },
                 .audio => return QovError.UnsupportedAudio,
             }
@@ -379,6 +467,33 @@ fn writeRgba(pixels: []u8, index: usize, color: Rgba) void {
     pixels[base + 1] = color.g;
     pixels[base + 2] = color.b;
     pixels[base + 3] = color.a;
+}
+
+fn expandRgbToRgba(dst: []u8, src: []const u8) void {
+    std.debug.assert(src.len % 3 == 0);
+    std.debug.assert(dst.len == (src.len / 3) * 4);
+    var src_index: usize = 0;
+    var dst_index: usize = 0;
+    while (src_index < src.len) : (src_index += 3) {
+        dst[dst_index] = src[src_index];
+        dst[dst_index + 1] = src[src_index + 1];
+        dst[dst_index + 2] = src[src_index + 2];
+        dst[dst_index + 3] = 0xFF;
+        dst_index += 4;
+    }
+}
+
+fn stripRgbaToRgb(dst: []u8, src: []const u8) void {
+    std.debug.assert(src.len % 4 == 0);
+    std.debug.assert(dst.len == (src.len / 4) * 3);
+    var src_index: usize = 0;
+    var dst_index: usize = 0;
+    while (src_index < src.len) : (src_index += 4) {
+        dst[dst_index] = src[src_index];
+        dst[dst_index + 1] = src[src_index + 1];
+        dst[dst_index + 2] = src[src_index + 2];
+        dst_index += 3;
+    }
 }
 
 pub fn encodeIFrame(writer: anytype, pixels: []const u8) (QovError || writerErrorType(@TypeOf(writer)))!void {
@@ -810,6 +925,26 @@ test "header validation for RGBA-only frames" {
     try std.testing.expectEqual(@as(usize, 24), headerFrameBytes(header));
 }
 
+test "header validation for RGB-only frames" {
+    const header = Header{
+        .width = 2,
+        .height = 3,
+        .fps_num = 30,
+        .fps_den = 1,
+        .colorspace = .srgb,
+        .channels = .rgb,
+        .flags = .{ .rgb_only = true },
+        .gop_size = 30,
+        .has_audio = false,
+        .audio_sample_rate = 0,
+        .audio_channels = 0,
+        .frame_count = 0,
+    };
+
+    try validateHeader(header);
+    try std.testing.expectEqual(@as(usize, 18), headerFrameBytes(header));
+}
+
 test "header read/write roundtrip" {
     const header = Header{
         .width = 320,
@@ -845,6 +980,7 @@ test "header read/write roundtrip" {
     try std.testing.expectEqual(header.audio_sample_rate, decoded.audio_sample_rate);
     try std.testing.expectEqual(header.audio_channels, decoded.audio_channels);
     try std.testing.expectEqual(header.frame_count, decoded.frame_count);
+    try std.testing.expectEqual(header.flags, decoded.flags);
 }
 
 test "chunk header and payload read/write roundtrip" {
@@ -955,6 +1091,56 @@ test "stream encode/decode roundtrip" {
         10, 20, 30, 255,
         41, 51, 61, 255,
         70, 80, 90, 255,
+    };
+
+    const frames = [_][]const u8{ &frame0, &frame1 };
+
+    var encoded = std.ArrayList(u8).empty;
+    defer encoded.deinit(std.testing.allocator);
+
+    var encoded_writer = encoded.writer(std.testing.allocator);
+    try encodeStream(std.testing.allocator, &encoded_writer, header, &frames);
+
+    var out0: [frame0.len]u8 = undefined;
+    var out1: [frame1.len]u8 = undefined;
+    var out_frames = [_][]u8{ &out0, &out1 };
+
+    var stream = std.io.fixedBufferStream(encoded.items);
+    var stream_reader = stream.reader();
+    const decoded_header = try decodeStream(std.testing.allocator, &stream_reader, &out_frames);
+
+    try std.testing.expectEqual(header.width, decoded_header.width);
+    try std.testing.expectEqual(header.height, decoded_header.height);
+    try std.testing.expectEqual(header.frame_count, decoded_header.frame_count);
+    try std.testing.expectEqualSlices(u8, &frame0, out_frames[0]);
+    try std.testing.expectEqualSlices(u8, &frame1, out_frames[1]);
+    try std.testing.expectEqual(encoded.items.len, stream.pos);
+}
+
+test "stream encode/decode roundtrip RGB-only" {
+    const header = Header{
+        .width = 2,
+        .height = 1,
+        .fps_num = 30,
+        .fps_den = 1,
+        .colorspace = .srgb,
+        .channels = .rgb,
+        .flags = .{ .rgb_only = true },
+        .gop_size = 2,
+        .has_audio = false,
+        .audio_sample_rate = 0,
+        .audio_channels = 0,
+        .frame_count = 2,
+    };
+
+    const frame0 = [_]u8{
+        10, 20, 30,
+        40, 50, 60,
+    };
+
+    const frame1 = [_]u8{
+        10, 20, 30,
+        42, 52, 62,
     };
 
     const frames = [_][]const u8{ &frame0, &frame1 };
