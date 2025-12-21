@@ -39,6 +39,7 @@
 /// ```
 const std = @import("std");
 const builtin = @import("builtin");
+const qoa_stream = @import("qoa_stream.zig");
 
 fn writerErrorType(comptime WriterType: type) type {
     return switch (@typeInfo(WriterType)) {
@@ -360,6 +361,63 @@ pub fn readChunkPayload(reader: anytype, payload: []u8) (QovError || readerError
 /// Writes a chunk payload to the stream.
 pub fn writeChunkPayload(writer: anytype, payload: []const u8) (QovError || writerErrorType(@TypeOf(writer)))!void {
     try writer.writeAll(payload);
+}
+
+/// Validates an audio chunk payload containing concatenated QOA frames.
+pub fn validateAudioChunkPayload(header: Header, payload: []const u8) QovError!void {
+    if (!header.has_audio) return QovError.InvalidChunk;
+    if (header.audio_channels == 0) return QovError.InvalidChunk;
+    if (header.audio_channels > qoa_stream.max_channels) return QovError.InvalidChunk;
+
+    const max_frame_bytes = qoa_stream.maxFrameBytes(header.audio_channels);
+    const expected_frames: usize = @intCast(header.audio_frames_per_chunk);
+
+    var offset: usize = 0;
+    var frames_seen: usize = 0;
+    while (offset < payload.len) {
+        if (payload.len - offset < 8) return QovError.InvalidChunk;
+        const frame_header = qoa_stream.parseFrameHeader(payload[offset..]) catch return QovError.InvalidChunk;
+        if (frame_header.channels != header.audio_channels) return QovError.InvalidChunk;
+        if (frame_header.sample_rate != header.audio_sample_rate) return QovError.InvalidChunk;
+        if (frame_header.frame_length == 0) return QovError.InvalidChunk;
+
+        const frame_size: usize = @intCast(frame_header.frame_size);
+        if (frame_size < 8) return QovError.InvalidChunk;
+        if (frame_size > max_frame_bytes) return QovError.InvalidChunk;
+        if (offset + frame_size > payload.len) return QovError.InvalidChunk;
+
+        offset += frame_size;
+        frames_seen += 1;
+        if (frames_seen > expected_frames) return QovError.InvalidChunk;
+    }
+
+    if (offset != payload.len) return QovError.InvalidChunk;
+    if (frames_seen != expected_frames) return QovError.InvalidChunk;
+}
+
+/// Writes an audio chunk header and payload after validating QOA frames.
+pub fn writeAudioChunk(writer: anytype, header: Header, payload: []const u8) (QovError || writerErrorType(@TypeOf(writer)))!void {
+    try validateAudioChunkPayload(header, payload);
+    if (payload.len > std.math.maxInt(u32)) return QovError.InvalidChunk;
+    try writeChunkHeader(writer, .{
+        .chunk_type = .audio,
+        .payload_size = @intCast(payload.len),
+        .frame_duration_us = 0,
+    }, header.flags.frame_metadata);
+    try writeChunkPayload(writer, payload);
+}
+
+/// Reads an audio chunk and validates the QOA payload.
+pub fn readAudioChunk(reader: anytype, header: Header, payload: []u8) (QovError || readerErrorType(@TypeOf(reader)))!usize {
+    if (!header.has_audio) return QovError.InvalidHeader;
+    const chunk_header = try readChunkHeader(reader, header.flags.frame_metadata);
+    if (chunk_header.chunk_type != .audio) return QovError.InvalidChunk;
+
+    const payload_size: usize = @intCast(chunk_header.payload_size);
+    if (payload_size > payload.len) return QovError.InvalidChunk;
+    try readChunkPayload(reader, payload[0..payload_size]);
+    try validateAudioChunkPayload(header, payload[0..payload_size]);
+    return payload_size;
 }
 
 fn maxFramePayloadBytes(header: Header) usize {

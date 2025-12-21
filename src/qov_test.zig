@@ -1,5 +1,6 @@
 const std = @import("std");
 const qov = @import("qov.zig");
+const qoa_stream = @import("qoa_stream.zig");
 
 const qoi_magic = [4]u8{ 'q', 'o', 'i', 'f' };
 
@@ -337,6 +338,54 @@ test "stream chunk payload sizes match encoded payloads" {
     try qov.readChunkPayload(&reader, chunk1_payload);
     try std.testing.expectEqual(pframe_payload.items.len, chunk1_payload.len);
 
+    try std.testing.expectEqual(encoded.items.len, stream.pos);
+}
+
+test "audio chunk helpers validate QOA payloads" {
+    const header = qov.Header{
+        .width = 1,
+        .height = 1,
+        .fps_num = 30,
+        .fps_den = 1,
+        .colorspace = .srgb,
+        .channels = .rgba,
+        .gop_size = 1,
+        .has_audio = true,
+        .audio_sample_rate = 24000,
+        .audio_channels = 2,
+        .audio_frames_per_chunk = 2,
+        .frame_count = 0,
+    };
+
+    const file_bytes = try std.fs.cwd().readFileAlloc(std.testing.allocator, "arcade.qoa", std.math.maxInt(usize));
+    defer std.testing.allocator.free(file_bytes);
+
+    var offset: usize = 8;
+    var frames_seen: usize = 0;
+    const frames_per_chunk: usize = @intCast(header.audio_frames_per_chunk);
+    while (frames_seen < frames_per_chunk) : (frames_seen += 1) {
+        const frame_header = try qoa_stream.parseFrameHeader(file_bytes[offset..]);
+        const frame_size: usize = @intCast(frame_header.frame_size);
+        offset += frame_size;
+        try std.testing.expect(offset <= file_bytes.len);
+    }
+
+    const payload = file_bytes[8..offset];
+    try qov.validateAudioChunkPayload(header, payload);
+
+    var encoded = std.ArrayList(u8).empty;
+    defer encoded.deinit(std.testing.allocator);
+    var writer = encoded.writer(std.testing.allocator);
+    try qov.writeAudioChunk(&writer, header, payload);
+
+    var stream = std.io.fixedBufferStream(encoded.items);
+    var reader = stream.reader();
+    const payload_buf = try std.testing.allocator.alloc(u8, payload.len);
+    defer std.testing.allocator.free(payload_buf);
+
+    const payload_size = try qov.readAudioChunk(&reader, header, payload_buf);
+    try std.testing.expectEqual(payload.len, payload_size);
+    try std.testing.expectEqualSlices(u8, payload, payload_buf[0..payload_size]);
     try std.testing.expectEqual(encoded.items.len, stream.pos);
 }
 
