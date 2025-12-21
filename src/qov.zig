@@ -263,48 +263,85 @@ pub fn encodeStream(allocator: std.mem.Allocator, writer: anytype, header: Heade
     }
 }
 
-pub fn decodeStream(allocator: std.mem.Allocator, reader: anytype, frames: [][]u8) (QovError || std.mem.Allocator.Error || readerErrorType(@TypeOf(reader)))!Header {
-    const header = try readHeader(reader);
+pub fn StreamDecoder(comptime ReaderType: type) type {
+    return struct {
+        allocator: std.mem.Allocator,
+        reader: ReaderType,
+        header: Header,
+        payload: std.ArrayList(u8),
+        prev_pixels: ?[]u8 = null,
+        frame_index: usize = 0,
 
-    if (header.frame_count != 0 and header.frame_count != frames.len) return QovError.InvalidHeader;
-
-    const expected_bytes = headerFrameBytes(header);
-    for (frames) |frame| {
-        if (frame.len != expected_bytes) return QovError.InvalidChunk;
-    }
-
-    var payload = std.ArrayList(u8).empty;
-    defer payload.deinit(allocator);
-
-    var prev_pixels: ?[]u8 = null;
-
-    for (frames) |frame| {
-        const chunk_header = try readChunkHeader(reader);
-        const payload_size: usize = @intCast(chunk_header.payload_size);
-
-        try payload.resize(allocator, payload_size);
-        try readChunkPayload(reader, payload.items);
-
-        var stream = std.io.fixedBufferStream(payload.items);
-        var stream_reader = stream.reader();
-
-        switch (chunk_header.chunk_type) {
-            .iframe => {
-                try decodeIFrame(&stream_reader, frame);
-                prev_pixels = frame;
-            },
-            .pframe => {
-                const prev = prev_pixels orelse return QovError.InvalidChunk;
-                try decodePFrame(&stream_reader, frame, prev);
-                prev_pixels = frame;
-            },
-            .audio => return QovError.UnsupportedAudio,
+        pub fn init(allocator: std.mem.Allocator, reader: ReaderType) (QovError || std.mem.Allocator.Error || readerErrorType(ReaderType))!@This() {
+            const header = try readHeader(reader);
+            return .{
+                .allocator = allocator,
+                .reader = reader,
+                .header = header,
+                .payload = std.ArrayList(u8).empty,
+                .prev_pixels = null,
+                .frame_index = 0,
+            };
         }
 
-        if (stream.pos != payload.items.len) return QovError.InvalidChunk;
+        pub fn deinit(self: *@This()) void {
+            self.payload.deinit(self.allocator);
+        }
+
+        pub fn nextFrame(self: *@This(), frame: []u8) (QovError || std.mem.Allocator.Error || readerErrorType(ReaderType))!bool {
+            const expected_bytes = headerFrameBytes(self.header);
+            if (frame.len != expected_bytes) return QovError.InvalidChunk;
+
+            if (self.header.frame_count != 0 and self.frame_index >= self.header.frame_count) return false;
+
+            const chunk_header = readChunkHeader(self.reader) catch |err| switch (err) {
+                QovError.UnexpectedEof => {
+                    if (self.header.frame_count == 0) return false;
+                    return err;
+                },
+                else => return err,
+            };
+            const payload_size: usize = @intCast(chunk_header.payload_size);
+
+            try self.payload.resize(self.allocator, payload_size);
+            try readChunkPayload(self.reader, self.payload.items);
+
+            var stream = std.io.fixedBufferStream(self.payload.items);
+            var stream_reader = stream.reader();
+
+            switch (chunk_header.chunk_type) {
+                .iframe => {
+                    try decodeIFrame(&stream_reader, frame);
+                    self.prev_pixels = frame;
+                },
+                .pframe => {
+                    const prev = self.prev_pixels orelse return QovError.InvalidChunk;
+                    try decodePFrame(&stream_reader, frame, prev);
+                    self.prev_pixels = frame;
+                },
+                .audio => return QovError.UnsupportedAudio,
+            }
+
+            if (stream.pos != self.payload.items.len) return QovError.InvalidChunk;
+
+            self.frame_index += 1;
+            return true;
+        }
+    };
+}
+
+pub fn decodeStream(allocator: std.mem.Allocator, reader: anytype, frames: [][]u8) (QovError || std.mem.Allocator.Error || readerErrorType(@TypeOf(reader)))!Header {
+    var decoder = try StreamDecoder(@TypeOf(reader)).init(allocator, reader);
+    defer decoder.deinit();
+
+    if (decoder.header.frame_count != 0 and decoder.header.frame_count != frames.len) return QovError.InvalidHeader;
+
+    for (frames) |frame| {
+        const had_frame = try decoder.nextFrame(frame);
+        if (!had_frame) return QovError.UnexpectedEof;
     }
 
-    return header;
+    return decoder.header;
 }
 
 const Rgba = struct {
@@ -937,6 +974,56 @@ test "stream encode/decode roundtrip" {
     try std.testing.expectEqual(header.frame_count, decoded_header.frame_count);
     try std.testing.expectEqualSlices(u8, &frame0, out_frames[0]);
     try std.testing.expectEqualSlices(u8, &frame1, out_frames[1]);
+    try std.testing.expectEqual(encoded.items.len, stream.pos);
+}
+
+test "stream decoder nextFrame helper" {
+    const header = Header{
+        .width = 2,
+        .height = 1,
+        .fps_num = 24,
+        .fps_den = 1,
+        .colorspace = .srgb,
+        .channels = .rgba,
+        .gop_size = 2,
+        .has_audio = false,
+        .audio_sample_rate = 0,
+        .audio_channels = 0,
+        .frame_count = 2,
+    };
+
+    const frame0 = [_]u8{
+        1, 2, 3, 255,
+        4, 5, 6, 255,
+    };
+
+    const frame1 = [_]u8{
+        1, 2, 3, 255,
+        7, 8, 9, 255,
+    };
+
+    const frames = [_][]const u8{ &frame0, &frame1 };
+
+    var encoded = std.ArrayList(u8).empty;
+    defer encoded.deinit(std.testing.allocator);
+
+    var encoded_writer = encoded.writer(std.testing.allocator);
+    try encodeStream(std.testing.allocator, &encoded_writer, header, &frames);
+
+    var stream = std.io.fixedBufferStream(encoded.items);
+    var stream_reader = stream.reader();
+    var decoder = try StreamDecoder(@TypeOf(&stream_reader)).init(std.testing.allocator, &stream_reader);
+    defer decoder.deinit();
+
+    var out0: [frame0.len]u8 = undefined;
+    var out1: [frame1.len]u8 = undefined;
+
+    try std.testing.expect(try decoder.nextFrame(&out0));
+    try std.testing.expect(try decoder.nextFrame(&out1));
+    try std.testing.expect(!try decoder.nextFrame(&out1));
+
+    try std.testing.expectEqualSlices(u8, &frame0, &out0);
+    try std.testing.expectEqualSlices(u8, &frame1, &out1);
     try std.testing.expectEqual(encoded.items.len, stream.pos);
 }
 
