@@ -339,7 +339,10 @@ pub fn decodeStream(allocator: std.mem.Allocator, reader: anytype, frames: [][]u
 
     for (frames) |frame| {
         const had_frame = try decoder.nextFrame(frame);
-        if (!had_frame) return QovError.UnexpectedEof;
+        if (!had_frame) {
+            if (decoder.header.frame_count == 0) return decoder.header;
+            return QovError.UnexpectedEof;
+        }
     }
 
     return decoder.header;

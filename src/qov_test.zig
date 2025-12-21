@@ -270,6 +270,63 @@ test "stream chunk payload sizes match encoded payloads" {
     try std.testing.expectEqual(encoded.items.len, stream.pos);
 }
 
+test "stream decode stops on EOF when frame count unknown" {
+    const header = qov.Header{
+        .width = 2,
+        .height = 1,
+        .fps_num = 24,
+        .fps_den = 1,
+        .colorspace = .srgb,
+        .channels = .rgba,
+        .gop_size = 2,
+        .has_audio = false,
+        .audio_sample_rate = 0,
+        .audio_channels = 0,
+        .frame_count = 0,
+    };
+
+    const frame0 = [_]u8{
+        1, 2, 3, 255,
+        4, 5, 6, 255,
+    };
+    const frame1 = [_]u8{
+        1, 2, 3, 255,
+        7, 8, 9, 255,
+    };
+    const frames = [_][]const u8{ &frame0, &frame1 };
+
+    var encoded = std.ArrayList(u8).empty;
+    defer encoded.deinit(std.testing.allocator);
+
+    var encoded_writer = encoded.writer(std.testing.allocator);
+    try qov.encodeStream(std.testing.allocator, &encoded_writer, header, &frames);
+
+    const frame_bytes = qov.headerFrameBytes(header);
+    var out_frames = try std.testing.allocator.alloc([]u8, 4);
+    defer {
+        for (out_frames) |frame| std.testing.allocator.free(frame);
+        std.testing.allocator.free(out_frames);
+    }
+    for (out_frames) |*frame| {
+        frame.* = try std.testing.allocator.alloc(u8, frame_bytes);
+        @memset(frame.*, 0xAA);
+    }
+
+    var stream = std.io.fixedBufferStream(encoded.items);
+    var stream_reader = stream.reader();
+    const decoded_header = try qov.decodeStream(std.testing.allocator, &stream_reader, out_frames);
+
+    try std.testing.expectEqual(@as(u32, 0), decoded_header.frame_count);
+    try std.testing.expectEqualSlices(u8, &frame0, out_frames[0]);
+    try std.testing.expectEqualSlices(u8, &frame1, out_frames[1]);
+    for (out_frames[2..]) |frame| {
+        for (frame) |byte| {
+            try std.testing.expectEqual(@as(u8, 0xAA), byte);
+        }
+    }
+    try std.testing.expectEqual(encoded.items.len, stream.pos);
+}
+
 test "frame end marker detection" {
     const pixels = [_]u8{
         0, 0, 0, 255,
