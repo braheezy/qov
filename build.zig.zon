@@ -40,11 +40,12 @@
             .url = "git+https://github.com/braheezy/zigaudio#5bbbb6bb7d809d4344281b35567861405a69723d",
             .hash = "zigaudio-0.1.0-hDNruBohHQCMwkPQagcxQpNmCFFHq_RxNQIN1oFyvl2k",
         },
-        .sdl = .{
-            .path = "third_party/SDL.zig",
-        },
         .zmpeg = .{
             .path = "../zmpeg",
+        },
+        .sdl = .{
+            .url = "git+https://github.com/ikskuh/SDL.zig#a7e95b5fcc5b0d68921c148778609d2fe248c3d8",
+            .hash = "SDL2-0.0.0-yMCQivWqBABTfB8opAADsLCGxxu20vijLBW2hHdpTR-L",
         },
     },
     .paths = .{

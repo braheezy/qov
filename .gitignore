@@ -1,3 +1,5 @@
 *.qoi
 *.qoa
 *.qov
+/qoa.zig
+/qoi.zig
