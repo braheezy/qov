@@ -626,3 +626,309 @@ test "in-memory example encode/decode roundtrip" {
     try std.testing.expectEqualSlices(u8, &frame1, &out1);
     try std.testing.expectEqual(encoded.items.len, stream.pos);
 }
+
+test "audio header validation rejects invalid configs" {
+    const valid_audio_header = qov.Header{
+        .width = 1,
+        .height = 1,
+        .fps_num = 30,
+        .fps_den = 1,
+        .colorspace = .srgb,
+        .channels = .rgba,
+        .gop_size = 1,
+        .has_audio = true,
+        .audio_sample_rate = 48000,
+        .audio_channels = 2,
+        .audio_frames_per_chunk = 1,
+        .frame_count = 0,
+    };
+    try qov.validateHeader(valid_audio_header);
+
+    var no_sample_rate = valid_audio_header;
+    no_sample_rate.audio_sample_rate = 0;
+    try std.testing.expectError(qov.QovError.InvalidHeader, qov.validateHeader(no_sample_rate));
+
+    var no_channels = valid_audio_header;
+    no_channels.audio_channels = 0;
+    try std.testing.expectError(qov.QovError.InvalidHeader, qov.validateHeader(no_channels));
+
+    var no_frames_per_chunk = valid_audio_header;
+    no_frames_per_chunk.audio_frames_per_chunk = 0;
+    try std.testing.expectError(qov.QovError.InvalidHeader, qov.validateHeader(no_frames_per_chunk));
+
+    var audio_without_flag = valid_audio_header;
+    audio_without_flag.has_audio = false;
+    try std.testing.expectError(qov.QovError.InvalidHeader, qov.validateHeader(audio_without_flag));
+}
+
+test "audio chunk validation rejects mismatched params" {
+    const file_bytes = try std.fs.cwd().readFileAlloc(std.testing.allocator, "arcade.qoa", std.math.maxInt(usize));
+    defer std.testing.allocator.free(file_bytes);
+
+    const frame_header = try qoa_stream.parseFrameHeader(file_bytes[8..]);
+    const frame_size: usize = @intCast(frame_header.frame_size);
+    const payload = file_bytes[8 .. 8 + frame_size];
+
+    const header = qov.Header{
+        .width = 1,
+        .height = 1,
+        .fps_num = 30,
+        .fps_den = 1,
+        .colorspace = .srgb,
+        .channels = .rgba,
+        .gop_size = 1,
+        .has_audio = true,
+        .audio_sample_rate = frame_header.sample_rate,
+        .audio_channels = frame_header.channels,
+        .audio_frames_per_chunk = 1,
+        .frame_count = 0,
+    };
+    try qov.validateAudioChunkPayload(header, payload);
+
+    var wrong_sample_rate = header;
+    wrong_sample_rate.audio_sample_rate = 44100;
+    try std.testing.expectError(qov.QovError.InvalidChunk, qov.validateAudioChunkPayload(wrong_sample_rate, payload));
+
+    var wrong_channels = header;
+    wrong_channels.audio_channels = 1;
+    try std.testing.expectError(qov.QovError.InvalidChunk, qov.validateAudioChunkPayload(wrong_channels, payload));
+
+    var wrong_frame_count = header;
+    wrong_frame_count.audio_frames_per_chunk = 2;
+    try std.testing.expectError(qov.QovError.InvalidChunk, qov.validateAudioChunkPayload(wrong_frame_count, payload));
+}
+
+test "stream decoder returns audio packets via nextPacket" {
+    const file_bytes = try std.fs.cwd().readFileAlloc(std.testing.allocator, "arcade.qoa", std.math.maxInt(usize));
+    defer std.testing.allocator.free(file_bytes);
+
+    const frame_header = try qoa_stream.parseFrameHeader(file_bytes[8..]);
+    const frame_size: usize = @intCast(frame_header.frame_size);
+    const audio_payload = file_bytes[8 .. 8 + frame_size];
+
+    const frame0 = [_]u8{ 0x10, 0x20, 0x30, 0xFF };
+    const frames = [_][]const u8{&frame0};
+
+    const header = qov.Header{
+        .width = 1,
+        .height = 1,
+        .fps_num = 30,
+        .fps_den = 1,
+        .colorspace = .srgb,
+        .channels = .rgba,
+        .gop_size = 1,
+        .has_audio = true,
+        .audio_sample_rate = frame_header.sample_rate,
+        .audio_channels = frame_header.channels,
+        .audio_frames_per_chunk = 1,
+        .frame_count = 1,
+    };
+
+    var encoded = std.ArrayList(u8).empty;
+    defer encoded.deinit(std.testing.allocator);
+    var writer = encoded.writer(std.testing.allocator);
+    try qov.encodeStreamWithOptions(std.testing.allocator, &writer, header, &frames, null, .{
+        .audio_chunks = &[_][]const u8{audio_payload},
+    });
+
+    var stream = std.io.fixedBufferStream(encoded.items);
+    var reader = stream.reader();
+    var decoder = try qov.StreamDecoder(@TypeOf(&reader)).init(std.testing.allocator, &reader);
+    defer decoder.deinit();
+
+    var out_frame: [frame0.len]u8 = undefined;
+    var audio_seen = false;
+    var frame_seen = false;
+
+    while (true) {
+        const packet = try decoder.nextPacket(&out_frame);
+        if (packet == null) break;
+
+        switch (packet.?) {
+            .frame => frame_seen = true,
+            .audio => |data| {
+                audio_seen = true;
+                try std.testing.expectEqualSlices(u8, audio_payload, data);
+            },
+        }
+    }
+
+    try std.testing.expect(audio_seen);
+    try std.testing.expect(frame_seen);
+    try std.testing.expectEqualSlices(u8, &frame0, &out_frame);
+}
+
+test "stream decode handles audio longer than video" {
+    const file_bytes = try std.fs.cwd().readFileAlloc(std.testing.allocator, "arcade.qoa", std.math.maxInt(usize));
+    defer std.testing.allocator.free(file_bytes);
+
+    var audio_chunks = std.ArrayList([]const u8).empty;
+    defer audio_chunks.deinit(std.testing.allocator);
+
+    var offset: usize = 8;
+    var frame_header = try qoa_stream.parseFrameHeader(file_bytes[offset..]);
+    while (audio_chunks.items.len < 3) {
+        const frame_size: usize = @intCast(frame_header.frame_size);
+        if (offset + frame_size > file_bytes.len) break;
+        try audio_chunks.append(std.testing.allocator, file_bytes[offset .. offset + frame_size]);
+        offset += frame_size;
+        if (offset + 8 <= file_bytes.len) {
+            frame_header = try qoa_stream.parseFrameHeader(file_bytes[offset..]);
+        }
+    }
+
+    const first_frame_header = try qoa_stream.parseFrameHeader(audio_chunks.items[0]);
+
+    const frame0 = [_]u8{ 0xAA, 0xBB, 0xCC, 0xFF };
+    const frames = [_][]const u8{&frame0};
+
+    const header = qov.Header{
+        .width = 1,
+        .height = 1,
+        .fps_num = 30,
+        .fps_den = 1,
+        .colorspace = .srgb,
+        .channels = .rgba,
+        .gop_size = 1,
+        .has_audio = true,
+        .audio_sample_rate = first_frame_header.sample_rate,
+        .audio_channels = first_frame_header.channels,
+        .audio_frames_per_chunk = 1,
+        .frame_count = 1,
+    };
+
+    var encoded = std.ArrayList(u8).empty;
+    defer encoded.deinit(std.testing.allocator);
+    var writer = encoded.writer(std.testing.allocator);
+    try qov.encodeStreamWithOptions(std.testing.allocator, &writer, header, &frames, null, .{
+        .audio_chunks = audio_chunks.items,
+    });
+
+    var stream = std.io.fixedBufferStream(encoded.items);
+    var reader = stream.reader();
+    var decoder = try qov.StreamDecoder(@TypeOf(&reader)).init(std.testing.allocator, &reader);
+    defer decoder.deinit();
+
+    var out_frame: [frame0.len]u8 = undefined;
+    var audio_count: usize = 0;
+    var frame_count: usize = 0;
+
+    while (true) {
+        const packet = try decoder.nextPacket(&out_frame);
+        if (packet == null) break;
+
+        switch (packet.?) {
+            .frame => frame_count += 1,
+            .audio => audio_count += 1,
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), frame_count);
+    try std.testing.expectEqual(@as(usize, 3), audio_count);
+}
+
+test "end-to-end encode/decode with arcade.qoa audio roundtrip" {
+    const allocator = std.testing.allocator;
+
+    const qoa_bytes = try std.fs.cwd().readFileAlloc(allocator, "arcade.qoa", std.math.maxInt(usize));
+    defer allocator.free(qoa_bytes);
+
+    var audio_chunks = std.ArrayList([]const u8).empty;
+    defer audio_chunks.deinit(allocator);
+
+    var qoa_offset: usize = 8;
+    const first_qoa_header = try qoa_stream.parseFrameHeader(qoa_bytes[qoa_offset..]);
+    const num_audio_chunks = 5;
+    while (audio_chunks.items.len < num_audio_chunks and qoa_offset + 8 <= qoa_bytes.len) {
+        const fh = try qoa_stream.parseFrameHeader(qoa_bytes[qoa_offset..]);
+        const frame_size: usize = @intCast(fh.frame_size);
+        if (qoa_offset + frame_size > qoa_bytes.len) break;
+        try audio_chunks.append(allocator, qoa_bytes[qoa_offset .. qoa_offset + frame_size]);
+        qoa_offset += frame_size;
+    }
+
+    const qoi_frame0 = try std.fs.cwd().readFileAlloc(allocator, "testdata/qoi/frame_0.qoi", std.math.maxInt(usize));
+    defer allocator.free(qoi_frame0);
+    const qoi_frame1 = try std.fs.cwd().readFileAlloc(allocator, "testdata/qoi/frame_1.qoi", std.math.maxInt(usize));
+    defer allocator.free(qoi_frame1);
+    const qoi_frame2 = try std.fs.cwd().readFileAlloc(allocator, "testdata/qoi/frame_2.qoi", std.math.maxInt(usize));
+    defer allocator.free(qoi_frame2);
+
+    const frame0 = try loadQoiRgba(allocator, "testdata/qoi/frame_0.qoi");
+    defer allocator.free(frame0.pixels);
+    const frame1 = try loadQoiRgba(allocator, "testdata/qoi/frame_1.qoi");
+    defer allocator.free(frame1.pixels);
+    const frame2 = try loadQoiRgba(allocator, "testdata/qoi/frame_2.qoi");
+    defer allocator.free(frame2.pixels);
+
+    const frames = [_][]const u8{ frame0.pixels, frame1.pixels, frame2.pixels };
+
+    const header = qov.Header{
+        .width = @intCast(frame0.header.width),
+        .height = @intCast(frame0.header.height),
+        .fps_num = 30,
+        .fps_den = 1,
+        .colorspace = .srgb,
+        .channels = .rgba,
+        .gop_size = 3,
+        .has_audio = true,
+        .audio_sample_rate = first_qoa_header.sample_rate,
+        .audio_channels = first_qoa_header.channels,
+        .audio_frames_per_chunk = 1,
+        .frame_count = 3,
+    };
+
+    var encoded = std.ArrayList(u8).empty;
+    defer encoded.deinit(allocator);
+    var writer = encoded.writer(allocator);
+    try qov.encodeStreamWithOptions(allocator, &writer, header, &frames, null, .{
+        .audio_chunks = audio_chunks.items,
+    });
+
+    var stream = std.io.fixedBufferStream(encoded.items);
+    var reader = stream.reader();
+    var decoder = try qov.StreamDecoder(@TypeOf(&reader)).init(allocator, &reader);
+    defer decoder.deinit();
+
+    try std.testing.expectEqual(header.width, decoder.header.width);
+    try std.testing.expectEqual(header.height, decoder.header.height);
+    try std.testing.expect(decoder.header.has_audio);
+    try std.testing.expectEqual(first_qoa_header.sample_rate, decoder.header.audio_sample_rate);
+    try std.testing.expectEqual(first_qoa_header.channels, decoder.header.audio_channels);
+
+    const frame_bytes = qov.headerFrameBytes(decoder.header);
+    const out_frame = try allocator.alloc(u8, frame_bytes);
+    defer allocator.free(out_frame);
+
+    var decoded_audio = std.ArrayList([]u8).empty;
+    defer {
+        for (decoded_audio.items) |chunk| allocator.free(chunk);
+        decoded_audio.deinit(allocator);
+    }
+
+    var video_count: usize = 0;
+    const expected_frames = [_][]const u8{ frame0.pixels, frame1.pixels, frame2.pixels };
+
+    while (true) {
+        const packet = try decoder.nextPacket(out_frame);
+        if (packet == null) break;
+
+        switch (packet.?) {
+            .frame => {
+                try std.testing.expectEqualSlices(u8, expected_frames[video_count], out_frame);
+                video_count += 1;
+            },
+            .audio => |data| {
+                const chunk_copy = try allocator.dupe(u8, data);
+                try decoded_audio.append(allocator, chunk_copy);
+            },
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), video_count);
+    try std.testing.expectEqual(num_audio_chunks, decoded_audio.items.len);
+
+    for (audio_chunks.items, 0..) |original, i| {
+        try std.testing.expectEqualSlices(u8, original, decoded_audio.items[i]);
+    }
+}

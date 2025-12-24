@@ -1,4 +1,5 @@
 const std = @import("std");
+const sdl = @import("sdl");
 
 // Although this function looks imperative, it does not perform the build
 // directly and instead it mutates the build graph (`b`) that will be then
@@ -40,6 +41,8 @@ pub fn build(b: *std.Build) void {
         // which requires us to specify a target.
         .target = target,
     });
+
+    const sdl_sdk = sdl.init(b, .{});
 
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
@@ -89,6 +92,21 @@ pub fn build(b: *std.Build) void {
     // by passing `--prefix` or `-p`.
     b.installArtifact(exe);
 
+    const player_module = b.createModule(.{
+        .root_source_file = b.path("src/player.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    player_module.addImport("qov", mod);
+    player_module.addImport("sdl2", sdl_sdk.getWrapperModule());
+
+    const player_exe = b.addExecutable(.{
+        .name = "qov-play",
+        .root_module = player_module,
+    });
+    sdl_sdk.link(player_exe, .static, sdl.Library.SDL2);
+    b.installArtifact(player_exe);
+
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).
     // This will evaluate the `run` step rather than the default step.
@@ -113,6 +131,14 @@ pub fn build(b: *std.Build) void {
     // command itself, like this: `zig build run -- arg1 arg2 etc`
     if (b.args) |args| {
         run_cmd.addArgs(args);
+    }
+
+    const play_step = b.step("play", "Run the SDL player");
+    const play_cmd = b.addRunArtifact(player_exe);
+    play_step.dependOn(&play_cmd.step);
+    play_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        play_cmd.addArgs(args);
     }
 
     // Creates an executable that will run `test` blocks from the provided module.

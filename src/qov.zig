@@ -151,6 +151,8 @@ pub const QovError = error{
 };
 
 pub const QoaFrameHeader = qoa_stream.FrameHeader;
+pub const QoaFrameDecoder = qoa_stream.FrameDecoder;
+pub const qoaMaxSamplesPerFrame = qoa_stream.maxSamplesPerFrame;
 
 pub fn parseQoaFrameHeader(bytes: []const u8) !qoa_stream.FrameHeader {
     return qoa_stream.parseFrameHeader(bytes);

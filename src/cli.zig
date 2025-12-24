@@ -1,10 +1,11 @@
 /// QOV command-line interface.
 /// Usage:
 ///   qov encode [--audio input.qoa] <output.qov> <input1.qoi> [input2.qoi ...]
-///   qov decode <input.qov> <output_dir>
+///   qov decode [--audio output.qoa] <input.qov> <output_dir>
 ///   qov info <input.qov>
 /// Example:
 ///   qov encode anim.qov frame_000.qoi frame_001.qoi
+///   qov decode --audio out.qoa anim.qov frames/
 ///   qov info anim.qov
 const std = @import("std");
 const qov = @import("qov");
@@ -68,11 +69,12 @@ fn runMain(allocator: std.mem.Allocator) !void {
         const encode_args = try parseEncodeArgs(args[2..]);
         try runEncode(allocator, encode_args.output_path, encode_args.input_paths, encode_args.audio_path);
     } else if (std.mem.eql(u8, command, "decode")) {
-        if (args.len != 4) {
+        if (args.len < 4) {
             try printUsage();
             return CliError.InvalidArgs;
         }
-        try runDecode(allocator, args[2], args[3]);
+        const decode_args = try parseDecodeArgs(args[2..]);
+        try runDecode(allocator, decode_args.input_path, decode_args.output_dir, decode_args.audio_path);
     } else if (std.mem.eql(u8, command, "info")) {
         if (args.len != 3) {
             try printUsage();
@@ -96,7 +98,7 @@ fn printUsage() !void {
     try printStderr(
         "Usage:\n" ++
             "  qov encode [--audio input.qoa] <output.qov> <input1.qoi> [input2.qoi ...]\n" ++
-            "  qov decode <input.qov> <output_dir>\n" ++
+            "  qov decode [--audio output.qoa] <input.qov> <output_dir>\n" ++
             "  qov info <input.qov>\n",
         .{},
     );
@@ -113,6 +115,12 @@ fn isReportedError(err: anyerror) bool {
 const EncodeArgs = struct {
     output_path: []const u8,
     input_paths: []const []const u8,
+    audio_path: ?[]const u8,
+};
+
+const DecodeArgs = struct {
+    input_path: []const u8,
+    output_dir: []const u8,
     audio_path: ?[]const u8,
 };
 
@@ -153,6 +161,36 @@ fn parseEncodeArgs(args: []const []const u8) !EncodeArgs {
     return .{
         .output_path = output_path,
         .input_paths = args[index..],
+        .audio_path = audio_path,
+    };
+}
+
+fn parseDecodeArgs(args: []const []const u8) !DecodeArgs {
+    var index: usize = 0;
+    var audio_path: ?[]const u8 = null;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--audio") or std.mem.eql(u8, arg, "-a")) {
+            if (audio_path != null) return CliError.InvalidArgs;
+            index += 1;
+            if (index >= args.len) return CliError.InvalidArgs;
+            audio_path = args[index];
+            continue;
+        }
+        break;
+    }
+
+    if (index >= args.len) return CliError.InvalidArgs;
+    const input_path = args[index];
+    index += 1;
+    if (index >= args.len) return CliError.InvalidArgs;
+    const output_dir = args[index];
+    index += 1;
+    if (index != args.len) return CliError.InvalidArgs;
+
+    return .{
+        .input_path = input_path,
+        .output_dir = output_dir,
         .audio_path = audio_path,
     };
 }
@@ -241,34 +279,23 @@ fn runEncode(allocator: std.mem.Allocator, output_path: []const u8, input_paths:
     try out_writer.interface.flush();
 }
 
-fn runDecode(allocator: std.mem.Allocator, input_path: []const u8, output_dir: []const u8) !void {
+fn runDecode(allocator: std.mem.Allocator, input_path: []const u8, output_dir: []const u8, audio_path: ?[]const u8) !void {
     const file_bytes = try std.fs.cwd().readFileAlloc(allocator, input_path, std.math.maxInt(usize));
     defer allocator.free(file_bytes);
 
     var stream = std.io.fixedBufferStream(file_bytes);
     var stream_reader = stream.reader();
-    const header = try qov.readHeader(&stream_reader);
+    var decoder = try qov.StreamDecoder(@TypeOf(&stream_reader)).init(allocator, &stream_reader);
+    defer decoder.deinit();
 
+    const header = decoder.header;
     if (header.frame_count == 0) return CliError.StreamingNotSupported;
 
-    const frame_count: usize = @intCast(header.frame_count);
-    const frame_bytes = qov.headerFrameBytes(header);
-
-    const frames = try allocator.alloc([]u8, frame_count);
-    defer {
-        for (frames) |frame| allocator.free(frame);
-        allocator.free(frames);
-    }
-
-    for (frames) |*frame| {
-        frame.* = try allocator.alloc(u8, frame_bytes);
-    }
-
-    stream.pos = 0;
-    stream_reader = stream.reader();
-    _ = try qov.decodeStream(allocator, &stream_reader, frames);
-
     try std.fs.cwd().makePath(output_dir);
+
+    const frame_bytes = qov.headerFrameBytes(header);
+    const frame = try allocator.alloc(u8, frame_bytes);
+    defer allocator.free(frame);
 
     const rgb_only = qov.isRgbOnly(header);
     var rgba_frame: ?[]u8 = null;
@@ -278,23 +305,80 @@ fn runDecode(allocator: std.mem.Allocator, input_path: []const u8, output_dir: [
         rgba_frame = try allocator.alloc(u8, rgba_bytes);
     }
 
-    for (frames, 0..) |frame, index| {
-        const filename = try std.fmt.allocPrint(allocator, "{s}/frame_{d:0>6}.qoi", .{ output_dir, index });
-        defer allocator.free(filename);
+    var audio_chunks = std.ArrayList([]const u8).empty;
+    defer audio_chunks.deinit(allocator);
 
-        var out_file = try std.fs.cwd().createFile(filename, .{ .truncate = true });
-        defer out_file.close();
+    var frame_index: usize = 0;
+    while (true) {
+        const packet = try decoder.nextPacket(frame);
+        if (packet == null) break;
 
-        var out_buf: [4096]u8 = undefined;
-        var out_writer = out_file.writer(&out_buf);
-        const output_frame = if (rgb_only) blk: {
-            const rgba = rgba_frame orelse return CliError.InvalidQov;
-            expandRgbToRgba(rgba, frame);
-            break :blk rgba;
-        } else frame;
-        try writeQoi(&out_writer.interface, header.width, header.height, output_frame);
-        try out_writer.interface.flush();
+        switch (packet.?) {
+            .frame => {
+                const filename = try std.fmt.allocPrint(allocator, "{s}/frame_{d:0>6}.qoi", .{ output_dir, frame_index });
+                defer allocator.free(filename);
+
+                var out_file = try std.fs.cwd().createFile(filename, .{ .truncate = true });
+                defer out_file.close();
+
+                var out_buf: [4096]u8 = undefined;
+                var out_writer = out_file.writer(&out_buf);
+                const output_frame = if (rgb_only) blk: {
+                    const rgba = rgba_frame orelse return CliError.InvalidQov;
+                    expandRgbToRgba(rgba, frame);
+                    break :blk rgba;
+                } else frame;
+                try writeQoi(&out_writer.interface, header.width, header.height, output_frame);
+                try out_writer.interface.flush();
+                frame_index += 1;
+            },
+            .audio => |audio_data| {
+                if (audio_path != null) {
+                    const chunk_copy = try allocator.dupe(u8, audio_data);
+                    try audio_chunks.append(allocator, chunk_copy);
+                }
+            },
+        }
     }
+
+    if (audio_path) |path| {
+        if (header.has_audio and audio_chunks.items.len > 0) {
+            try writeQoaFile(allocator, path, header, audio_chunks.items);
+        }
+        for (audio_chunks.items) |chunk| allocator.free(@constCast(chunk));
+    }
+}
+
+fn writeQoaFile(allocator: std.mem.Allocator, path: []const u8, header: qov.Header, audio_chunks: []const []const u8) !void {
+    var total_samples: u64 = 0;
+    for (audio_chunks) |chunk| {
+        var offset: usize = 0;
+        while (offset < chunk.len) {
+            const frame_header = try qov.parseQoaFrameHeader(chunk[offset..]);
+            total_samples += @as(u64, frame_header.frame_length);
+            offset += @as(usize, frame_header.frame_size);
+        }
+    }
+
+    if (total_samples > std.math.maxInt(u32)) return CliError.InvalidQoa;
+
+    var out_file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+    defer out_file.close();
+
+    var out_buf: [8192]u8 = undefined;
+    var out_writer = out_file.writer(&out_buf);
+
+    var qoa_header: [8]u8 = undefined;
+    @memcpy(qoa_header[0..4], "qoaf");
+    std.mem.writeInt(u32, qoa_header[4..8], @intCast(total_samples), .big);
+    try out_writer.interface.writeAll(&qoa_header);
+
+    for (audio_chunks) |chunk| {
+        try out_writer.interface.writeAll(chunk);
+    }
+    try out_writer.interface.flush();
+    _ = allocator;
+    _ = header;
 }
 
 fn runInfo(allocator: std.mem.Allocator, input_path: []const u8) !void {
