@@ -97,8 +97,9 @@ fn runPlayer(allocator: std.mem.Allocator, input_path: []const u8, loop: bool) !
 
     const width: u31 = @intCast(decoder.header.width);
     const height: u31 = @intCast(decoder.header.height);
-    const display_width: u31 = @max(width * 4, 320);
-    const display_height: u31 = @max(height * 4, 240);
+    // Use native resolution, but ensure minimum 320x240 for very small videos
+    const display_width: u31 = @max(width, 320);
+    const display_height: u31 = @max(height, 240);
 
     const window = try sdl.createWindow(
         "QOV Player",
@@ -106,7 +107,7 @@ fn runPlayer(allocator: std.mem.Allocator, input_path: []const u8, loop: bool) !
         .centered,
         display_width,
         display_height,
-        .{},
+        .{ .resizable = false },
     );
     defer window.destroy();
 
@@ -119,7 +120,7 @@ fn runPlayer(allocator: std.mem.Allocator, input_path: []const u8, loop: bool) !
 
     const texture = try sdl.createTexture(
         renderer,
-        .rgba8888,
+        .abgr8888, // Use ABGR to match memory layout: R,G,B,A bytes on little-endian
         .streaming,
         width,
         height,
@@ -205,11 +206,13 @@ fn runPlayer(allocator: std.mem.Allocator, input_path: []const u8, loop: bool) !
         }
     }
 
-    if (audio_state) |*a| {
-        a.waitForDrain();
+    // Only wait for audio drain and hold window if user didn't request quit
+    if (!quit) {
+        if (audio_state) |*a| {
+            a.waitForDrain();
+        }
+        holdWindow(renderer, texture, had_any_frame);
     }
-
-    holdWindow(renderer, texture, had_any_frame);
 }
 
 fn pollQuit() bool {

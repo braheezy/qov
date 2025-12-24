@@ -43,6 +43,9 @@
         .sdl = .{
             .path = "third_party/SDL.zig",
         },
+        .zmpeg = .{
+            .path = "../zmpeg",
+        },
     },
     .paths = .{
         "build.zig",

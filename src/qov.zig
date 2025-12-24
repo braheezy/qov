@@ -779,7 +779,6 @@ pub fn StreamDecoder(comptime ReaderType: type) type {
         reader: ReaderType,
         header: Header,
         payload: std.ArrayList(u8),
-        prev_pixels: ?[]u8 = null,
         rgba_curr: ?[]u8 = null,
         rgba_prev: ?[]u8 = null,
         frame_index: usize = 0,
@@ -797,20 +796,20 @@ pub fn StreamDecoder(comptime ReaderType: type) type {
                 .reader = reader,
                 .header = header,
                 .payload = std.ArrayList(u8).empty,
-                .prev_pixels = null,
                 .rgba_curr = null,
                 .rgba_prev = null,
                 .frame_index = 0,
             };
-            if (header.flags.rgb_only) {
-                const rgba_bytes = headerFramePixels(header) * 4;
-                const buffer_a = try allocator.alloc(u8, rgba_bytes);
-                errdefer allocator.free(buffer_a);
-                const buffer_b = try allocator.alloc(u8, rgba_bytes);
-                errdefer allocator.free(buffer_b);
-                decoder.rgba_curr = buffer_a;
-                decoder.rgba_prev = buffer_b;
-            }
+            // Always allocate double buffers for P-frame decoding
+            // (rgb_only needs them for expand/strip, non-rgb_only needs them to
+            // avoid reading from the same buffer we're writing to)
+            const rgba_bytes = headerFramePixels(header) * 4;
+            const buffer_a = try allocator.alloc(u8, rgba_bytes);
+            errdefer allocator.free(buffer_a);
+            const buffer_b = try allocator.alloc(u8, rgba_bytes);
+            errdefer allocator.free(buffer_b);
+            decoder.rgba_curr = buffer_a;
+            decoder.rgba_prev = buffer_b;
             return decoder;
         }
 
@@ -866,33 +865,28 @@ pub fn StreamDecoder(comptime ReaderType: type) type {
 
                     switch (chunk_header.chunk_type) {
                         .iframe => {
+                            const curr = self.rgba_curr orelse return QovError.InvalidChunk;
+                            const prev = self.rgba_prev orelse return QovError.InvalidChunk;
+                            try decodeIFrame(&stream_reader, curr);
                             if (self.header.flags.rgb_only) {
-                                const curr = self.rgba_curr orelse return QovError.InvalidChunk;
-                                const prev = self.rgba_prev orelse return QovError.InvalidChunk;
-                                try decodeIFrame(&stream_reader, curr);
                                 stripRgbaToRgb(frame_buf, curr);
-                                self.rgba_curr = prev;
-                                self.rgba_prev = curr;
-                                self.prev_pixels = self.rgba_prev;
                             } else {
-                                try decodeIFrame(&stream_reader, frame_buf);
-                                self.prev_pixels = frame_buf;
+                                @memcpy(frame_buf, curr);
                             }
+                            self.rgba_curr = prev;
+                            self.rgba_prev = curr;
                         },
                         .pframe => {
-                            const prev = self.prev_pixels orelse return QovError.InvalidChunk;
+                            const curr = self.rgba_curr orelse return QovError.InvalidChunk;
+                            const prev = self.rgba_prev orelse return QovError.InvalidChunk;
+                            try decodePFrame(&stream_reader, curr, prev);
                             if (self.header.flags.rgb_only) {
-                                const curr = self.rgba_curr orelse return QovError.InvalidChunk;
-                                const prev_rgba = self.rgba_prev orelse return QovError.InvalidChunk;
-                                try decodePFrame(&stream_reader, curr, prev_rgba);
                                 stripRgbaToRgb(frame_buf, curr);
-                                self.rgba_curr = prev_rgba;
-                                self.rgba_prev = curr;
-                                self.prev_pixels = self.rgba_prev;
                             } else {
-                                try decodePFrame(&stream_reader, frame_buf, prev);
-                                self.prev_pixels = frame_buf;
+                                @memcpy(frame_buf, curr);
                             }
+                            self.rgba_curr = prev;
+                            self.rgba_prev = curr;
                         },
                         else => return QovError.InvalidChunk,
                     }
@@ -1165,6 +1159,7 @@ pub fn encodePFrame(writer: anytype, pixels: []const u8, prev_pixels: []const u8
 
         if (encodeTdiff(pixel, temporal)) |tdiff_byte| {
             try writer.writeAll(&[2]u8{ 0xFD, tdiff_byte });
+            color_lut[pixel.hash()] = pixel;
         } else {
             const hash = pixel.hash();
             if (color_lut[hash].eql(pixel)) {

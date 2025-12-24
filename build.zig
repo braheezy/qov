@@ -107,38 +107,67 @@ pub fn build(b: *std.Build) void {
     sdl_sdk.link(player_exe, .static, sdl.Library.SDL2);
     b.installArtifact(player_exe);
 
-    // This creates a top level step. Top level steps have a name and can be
-    // invoked by name when running `zig build` (e.g. `zig build run`).
-    // This will evaluate the `run` step rather than the default step.
-    // For a top level step to actually do something, it must depend on other
-    // steps (e.g. a Run step, as we will see in a moment).
-    const run_step = b.step("run", "Run the app");
-
-    // This creates a RunArtifact step in the build graph. A RunArtifact step
-    // invokes an executable compiled by Zig. Steps will only be executed by the
-    // runner if invoked directly by the user (in the case of top level steps)
-    // or if another step depends on it, so it's up to you to define when and
-    // how this Run step will be executed. In our case we want to run it when
-    // the user runs `zig build run`, so we create a dependency link.
-    const run_cmd = b.addRunArtifact(exe);
-    run_step.dependOn(&run_cmd.step);
-
-    // By making the run step depend on the default step, it will be run from the
-    // installation directory rather than directly from within the cache directory.
-    run_cmd.step.dependOn(b.getInstallStep());
-
-    // This allows the user to pass arguments to the application in the build
-    // command itself, like this: `zig build run -- arg1 arg2 etc`
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
-
-    const play_step = b.step("play", "Run the SDL player");
+    // "play" step - run qov-play directly with a .qov file
+    const play_step = b.step("play", "Play a QOV file: zig build play -- <file.qov>");
     const play_cmd = b.addRunArtifact(player_exe);
     play_step.dependOn(&play_cmd.step);
     play_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
         play_cmd.addArgs(args);
+    }
+
+    // MPEG to QOV converter
+    const zmpeg_dep = b.dependency("zmpeg", .{
+        .target = target,
+    });
+    const zmpeg_mod = zmpeg_dep.module("zmpeg");
+
+    const converter_module = b.createModule(.{
+        .root_source_file = b.path("src/mpeg2qov.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    converter_module.addImport("qov", mod);
+    converter_module.addImport("zmpeg", zmpeg_mod);
+
+    const converter_exe = b.addExecutable(.{
+        .name = "mpeg2qov",
+        .root_module = converter_module,
+    });
+    b.installArtifact(converter_exe);
+
+    const convert_step = b.step("convert", "Convert MPEG to QOV: zig build convert -- <input.mpg> <output.qov>");
+    const convert_cmd = b.addRunArtifact(converter_exe);
+    convert_step.dependOn(&convert_cmd.step);
+    convert_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        convert_cmd.addArgs(args);
+    }
+
+    // "run" step - convert MPEG and play it: zig build run -- <input.mpg>
+    const run_step = b.step("run", "Convert MPEG and play: zig build run -- <input.mpg>");
+    if (b.args) |args| {
+        if (args.len >= 1) {
+            const input_file = args[0];
+            const temp_qov = "/tmp/zig_build_run.qov";
+
+            // Step 1: Run mpeg2qov to convert
+            const convert_run = b.addRunArtifact(converter_exe);
+            convert_run.step.dependOn(b.getInstallStep());
+            convert_run.addArg(input_file);
+            convert_run.addArg(temp_qov);
+
+            // Step 2: Run qov-play on the converted file
+            const play_run = b.addRunArtifact(player_exe);
+            play_run.step.dependOn(&convert_run.step);
+            play_run.addArg(temp_qov);
+            // Pass remaining args (like --loop) to player
+            for (args[1..]) |arg| {
+                play_run.addArg(arg);
+            }
+
+            run_step.dependOn(&play_run.step);
+        }
     }
 
     // Creates an executable that will run `test` blocks from the provided module.
