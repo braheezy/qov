@@ -38,12 +38,15 @@ const FrameInfo = struct {
 };
 
 /// CLI entry point that dispatches subcommands.
-pub fn main() void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) void {
+    const allocator = init.gpa;
+    const io = init.io;
+    const args = init.minimal.args.toSlice(init.arena.allocator()) catch |err| {
+        printStderr("error: {s}\n", .{@errorName(err)}) catch {};
+        std.process.exit(1);
+    };
 
-    runMain(allocator) catch |err| {
+    runMain(allocator, io, args) catch |err| {
         if (!isReportedError(err)) {
             printStderr("error: {s}\n", .{@errorName(err)}) catch {};
         }
@@ -51,10 +54,7 @@ pub fn main() void {
     };
 }
 
-fn runMain(allocator: std.mem.Allocator) !void {
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
-
+fn runMain(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     if (args.len < 2) {
         try printUsage();
         return CliError.InvalidArgs;
@@ -67,20 +67,20 @@ fn runMain(allocator: std.mem.Allocator) !void {
             return CliError.InvalidArgs;
         }
         const encode_args = try parseEncodeArgs(args[2..]);
-        try runEncode(allocator, encode_args.output_path, encode_args.input_paths, encode_args.audio_path);
+        try runEncode(allocator, io, encode_args.output_path, encode_args.input_paths, encode_args.audio_path);
     } else if (std.mem.eql(u8, command, "decode")) {
         if (args.len < 4) {
             try printUsage();
             return CliError.InvalidArgs;
         }
         const decode_args = try parseDecodeArgs(args[2..]);
-        try runDecode(allocator, decode_args.input_path, decode_args.output_dir, decode_args.audio_path);
+        try runDecode(allocator, io, decode_args.input_path, decode_args.output_dir, decode_args.audio_path);
     } else if (std.mem.eql(u8, command, "info")) {
         if (args.len != 3) {
             try printUsage();
             return CliError.InvalidArgs;
         }
-        try runInfo(allocator, args[2]);
+        try runInfo(allocator, io, args[2]);
     } else {
         try printUsage();
         return CliError.InvalidArgs;
@@ -88,10 +88,7 @@ fn runMain(allocator: std.mem.Allocator) !void {
 }
 
 fn printStderr(comptime fmt: []const u8, args: anytype) !void {
-    var stderr_buf: [512]u8 = undefined;
-    var err = std.fs.File.stderr().writer(&stderr_buf);
-    defer err.interface.flush() catch {};
-    try err.interface.print(fmt, args);
+    std.debug.print(fmt, args);
 }
 
 fn printUsage() !void {
@@ -195,7 +192,7 @@ fn parseDecodeArgs(args: []const []const u8) !DecodeArgs {
     };
 }
 
-fn runEncode(allocator: std.mem.Allocator, output_path: []const u8, input_paths: []const []const u8, audio_path: ?[]const u8) !void {
+fn runEncode(allocator: std.mem.Allocator, io: std.Io, output_path: []const u8, input_paths: []const []const u8, audio_path: ?[]const u8) !void {
     var frames = std.ArrayList([]u8).empty;
     defer {
         for (frames.items) |frame| allocator.free(frame);
@@ -207,7 +204,7 @@ fn runEncode(allocator: std.mem.Allocator, output_path: []const u8, input_paths:
     var base_path: []const u8 = "";
 
     for (input_paths) |path| {
-        const file_bytes = try std.fs.cwd().readFileAlloc(allocator, path, std.math.maxInt(usize));
+        const file_bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .unlimited);
         defer allocator.free(file_bytes);
 
         const decoded = decodeQoiToRgba(allocator, file_bytes) catch |err| {
@@ -238,7 +235,7 @@ fn runEncode(allocator: std.mem.Allocator, output_path: []const u8, input_paths:
     defer if (audio_payloads) |*payloads| payloads.deinit(allocator);
 
     if (audio_path) |path| {
-        audio_payloads = loadQoaAudio(allocator, path) catch |err| {
+        audio_payloads = loadQoaAudio(allocator, io, path) catch |err| {
             if (err == CliError.InvalidQoa) {
                 try reportInvalidQoa(path);
             }
@@ -270,28 +267,27 @@ fn runEncode(allocator: std.mem.Allocator, output_path: []const u8, input_paths:
         encode_options.audio_chunks = payloads.chunks;
     }
 
-    var out_file = try std.fs.cwd().createFile(output_path, .{ .truncate = true });
-    defer out_file.close();
+    var out_file = try std.Io.Dir.cwd().createFile(io, output_path, .{ .truncate = true });
+    defer out_file.close(io);
 
     var out_buf: [8192]u8 = undefined;
-    var out_writer = out_file.writer(&out_buf);
+    var out_writer = out_file.writer(io, &out_buf);
     try qov.encodeStreamWithOptions(allocator, &out_writer.interface, header, frames.items, null, encode_options);
     try out_writer.interface.flush();
 }
 
-fn runDecode(allocator: std.mem.Allocator, input_path: []const u8, output_dir: []const u8, audio_path: ?[]const u8) !void {
-    const file_bytes = try std.fs.cwd().readFileAlloc(allocator, input_path, std.math.maxInt(usize));
+fn runDecode(allocator: std.mem.Allocator, io: std.Io, input_path: []const u8, output_dir: []const u8, audio_path: ?[]const u8) !void {
+    const file_bytes = try std.Io.Dir.cwd().readFileAlloc(io, input_path, allocator, .unlimited);
     defer allocator.free(file_bytes);
 
-    var stream = std.io.fixedBufferStream(file_bytes);
-    var stream_reader = stream.reader();
+    var stream_reader: std.Io.Reader = .fixed(file_bytes);
     var decoder = try qov.StreamDecoder(@TypeOf(&stream_reader)).init(allocator, &stream_reader);
     defer decoder.deinit();
 
     const header = decoder.header;
     if (header.frame_count == 0) return CliError.StreamingNotSupported;
 
-    try std.fs.cwd().makePath(output_dir);
+    try std.Io.Dir.cwd().createDirPath(io, output_dir);
 
     const frame_bytes = qov.headerFrameBytes(header);
     const frame = try allocator.alloc(u8, frame_bytes);
@@ -318,11 +314,11 @@ fn runDecode(allocator: std.mem.Allocator, input_path: []const u8, output_dir: [
                 const filename = try std.fmt.allocPrint(allocator, "{s}/frame_{d:0>6}.qoi", .{ output_dir, frame_index });
                 defer allocator.free(filename);
 
-                var out_file = try std.fs.cwd().createFile(filename, .{ .truncate = true });
-                defer out_file.close();
+                var out_file = try std.Io.Dir.cwd().createFile(io, filename, .{ .truncate = true });
+                defer out_file.close(io);
 
                 var out_buf: [4096]u8 = undefined;
-                var out_writer = out_file.writer(&out_buf);
+                var out_writer = out_file.writer(io, &out_buf);
                 const output_frame = if (rgb_only) blk: {
                     const rgba = rgba_frame orelse return CliError.InvalidQov;
                     expandRgbToRgba(rgba, frame);
@@ -343,13 +339,13 @@ fn runDecode(allocator: std.mem.Allocator, input_path: []const u8, output_dir: [
 
     if (audio_path) |path| {
         if (header.has_audio and audio_chunks.items.len > 0) {
-            try writeQoaFile(allocator, path, header, audio_chunks.items);
+            try writeQoaFile(allocator, io, path, header, audio_chunks.items);
         }
         for (audio_chunks.items) |chunk| allocator.free(@constCast(chunk));
     }
 }
 
-fn writeQoaFile(allocator: std.mem.Allocator, path: []const u8, header: qov.Header, audio_chunks: []const []const u8) !void {
+fn writeQoaFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8, header: qov.Header, audio_chunks: []const []const u8) !void {
     var total_samples: u64 = 0;
     for (audio_chunks) |chunk| {
         var offset: usize = 0;
@@ -362,11 +358,11 @@ fn writeQoaFile(allocator: std.mem.Allocator, path: []const u8, header: qov.Head
 
     if (total_samples > std.math.maxInt(u32)) return CliError.InvalidQoa;
 
-    var out_file = try std.fs.cwd().createFile(path, .{ .truncate = true });
-    defer out_file.close();
+    var out_file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    defer out_file.close(io);
 
     var out_buf: [8192]u8 = undefined;
-    var out_writer = out_file.writer(&out_buf);
+    var out_writer = out_file.writer(io, &out_buf);
 
     var qoa_header: [8]u8 = undefined;
     @memcpy(qoa_header[0..4], "qoaf");
@@ -381,18 +377,17 @@ fn writeQoaFile(allocator: std.mem.Allocator, path: []const u8, header: qov.Head
     _ = header;
 }
 
-fn runInfo(allocator: std.mem.Allocator, input_path: []const u8) !void {
-    const file_bytes = try std.fs.cwd().readFileAlloc(allocator, input_path, std.math.maxInt(usize));
+fn runInfo(allocator: std.mem.Allocator, io: std.Io, input_path: []const u8) !void {
+    const file_bytes = try std.Io.Dir.cwd().readFileAlloc(io, input_path, allocator, .unlimited);
     defer allocator.free(file_bytes);
 
-    var stream = std.io.fixedBufferStream(file_bytes);
-    var stream_reader = stream.reader();
+    var stream_reader: std.Io.Reader = .fixed(file_bytes);
     const header = try qov.readHeader(&stream_reader);
     const frame_infos = try collectFrameMetadata(allocator, &stream_reader, header);
     defer allocator.free(frame_infos);
 
     var stdout_buf: [1024]u8 = undefined;
-    var out = std.fs.File.stdout().writer(&stdout_buf);
+    var out = std.Io.File.stdout().writer(io, &stdout_buf);
     defer out.interface.flush() catch {};
     try writeInfo(&out.interface, header, frame_infos);
 }
@@ -407,10 +402,17 @@ fn reportInvalidQoa(path: []const u8) !void {
 }
 
 fn reportFrameSizeMismatch(base_path: []const u8, path: []const u8, expected_width: u32, expected_height: u32, actual_width: u32, actual_height: u32) !void {
-    var stderr_buf: [512]u8 = undefined;
-    var err = std.fs.File.stderr().writer(&stderr_buf);
-    defer err.interface.flush() catch {};
-    try writeFrameSizeMismatch(&err.interface, base_path, path, expected_width, expected_height, actual_width, actual_height);
+    if (base_path.len == 0) {
+        std.debug.print(
+            "error: frame size mismatch for '{s}': expected {d}x{d}, got {d}x{d}\n",
+            .{ path, expected_width, expected_height, actual_width, actual_height },
+        );
+    } else {
+        std.debug.print(
+            "error: frame size mismatch: '{s}' is {d}x{d}, but '{s}' is {d}x{d}\n",
+            .{ base_path, expected_width, expected_height, path, actual_width, actual_height },
+        );
+    }
 }
 
 fn writeFrameSizeMismatch(writer: anytype, base_path: []const u8, path: []const u8, expected_width: u32, expected_height: u32, actual_width: u32, actual_height: u32) !void {
@@ -438,8 +440,7 @@ fn describeQoiError(err: anyerror) []const u8 {
 }
 
 fn decodeQoiToRgba(allocator: std.mem.Allocator, file_bytes: []const u8) !struct { header: QoiHeader, pixels: []u8 } {
-    var stream = std.io.fixedBufferStream(file_bytes);
-    var stream_reader = stream.reader();
+    var stream_reader: std.Io.Reader = .fixed(file_bytes);
     const header = try readQoiHeader(&stream_reader);
 
     if (header.channels != 3 and header.channels != 4) return CliError.UnsupportedQoi;
@@ -452,7 +453,7 @@ fn decodeQoiToRgba(allocator: std.mem.Allocator, file_bytes: []const u8) !struct
     errdefer allocator.free(pixels);
 
     try qov.decodeIFrame(&stream_reader, pixels);
-    if (stream.pos != file_bytes.len) return CliError.InvalidQoi;
+    if (stream_reader.seek != file_bytes.len) return CliError.InvalidQoi;
 
     return .{ .header = header, .pixels = pixels };
 }
@@ -510,12 +511,12 @@ fn writeQoiHeader(writer: anytype, header: QoiHeader) !void {
 }
 
 fn readExact(reader: anytype, buf: []u8) !void {
-    const amount = try reader.readAll(buf);
+    const amount = try reader.readSliceShort(buf);
     if (amount != buf.len) return CliError.InvalidQoi;
 }
 
-fn loadQoaAudio(allocator: std.mem.Allocator, path: []const u8) !AudioPayloads {
-    const file_bytes = try std.fs.cwd().readFileAlloc(allocator, path, std.math.maxInt(usize));
+fn loadQoaAudio(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !AudioPayloads {
+    const file_bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .unlimited);
     errdefer allocator.free(file_bytes);
 
     if (file_bytes.len < 8) return CliError.InvalidQoa;
@@ -633,7 +634,7 @@ fn writeInfo(writer: anytype, header: qov.Header, frame_infos: []const FrameInfo
 }
 
 test "qoi read/write roundtrip" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -645,8 +646,9 @@ test "qoi read/write roundtrip" {
     var buffer = std.ArrayList(u8).empty;
     defer buffer.deinit(allocator);
 
-    var buffer_writer = buffer.writer(allocator);
-    try writeQoi(&buffer_writer, 2, 1, &pixels);
+    var buffer_writer_alloc: std.Io.Writer.Allocating = .fromArrayList(allocator, &buffer);
+    try writeQoi(&buffer_writer_alloc.writer, 2, 1, &pixels);
+    buffer = buffer_writer_alloc.toArrayList();
 
     const decoded = try decodeQoiToRgba(allocator, buffer.items);
     defer allocator.free(decoded.pixels);
@@ -665,7 +667,7 @@ test "cli QOI error descriptions" {
 }
 
 test "cli reads QOA audio metadata" {
-    var audio = try loadQoaAudio(std.testing.allocator, "arcade.qoa");
+    var audio = try loadQoaAudio(std.testing.allocator, std.testing.io, "arcade.qoa");
     defer audio.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u32, 24000), audio.sample_rate);
@@ -678,8 +680,9 @@ test "cli frame size mismatch message includes sizes" {
     var buffer = std.ArrayList(u8).empty;
     defer buffer.deinit(std.testing.allocator);
 
-    var writer = buffer.writer(std.testing.allocator);
-    try writeFrameSizeMismatch(&writer, "first.qoi", "second.qoi", 10, 12, 14, 16);
+    var writer_alloc: std.Io.Writer.Allocating = .fromArrayList(std.testing.allocator, &buffer);
+    try writeFrameSizeMismatch(&writer_alloc.writer, "first.qoi", "second.qoi", 10, 12, 14, 16);
+    buffer = writer_alloc.toArrayList();
     try std.testing.expectEqualStrings(
         "error: frame size mismatch for 'second.qoi': expected 10x12 (from 'first.qoi'), got 14x16\n",
         buffer.items,
@@ -706,31 +709,32 @@ test "cli info output includes frame metadata" {
         .frame_count = 2,
     };
 
-    var writer = buffer.writer(std.testing.allocator);
-    try qov.writeHeader(&writer, header);
-    try qov.writeChunkHeader(&writer, .{
+    var writer_alloc: std.Io.Writer.Allocating = .fromArrayList(std.testing.allocator, &buffer);
+    try qov.writeHeader(&writer_alloc.writer, header);
+    try qov.writeChunkHeader(&writer_alloc.writer, .{
         .chunk_type = .iframe,
         .payload_size = 2,
         .frame_duration_us = 10,
     }, true);
-    try writer.writeAll(&[_]u8{ 0x01, 0x02 });
-    try qov.writeChunkHeader(&writer, .{
+    try writer_alloc.writer.writeAll(&[_]u8{ 0x01, 0x02 });
+    try qov.writeChunkHeader(&writer_alloc.writer, .{
         .chunk_type = .pframe,
         .payload_size = 3,
         .frame_duration_us = 20,
     }, true);
-    try writer.writeAll(&[_]u8{ 0x03, 0x04, 0x05 });
+    try writer_alloc.writer.writeAll(&[_]u8{ 0x03, 0x04, 0x05 });
+    buffer = writer_alloc.toArrayList();
 
-    var stream = std.io.fixedBufferStream(buffer.items);
-    var stream_reader = stream.reader();
+    var stream_reader: std.Io.Reader = .fixed(buffer.items);
     const parsed_header = try qov.readHeader(&stream_reader);
     const frame_infos = try collectFrameMetadata(std.testing.allocator, &stream_reader, parsed_header);
     defer std.testing.allocator.free(frame_infos);
 
     var out = std.ArrayList(u8).empty;
     defer out.deinit(std.testing.allocator);
-    var out_writer = out.writer(std.testing.allocator);
-    try writeInfo(&out_writer, parsed_header, frame_infos);
+    var out_writer_alloc: std.Io.Writer.Allocating = .fromArrayList(std.testing.allocator, &out);
+    try writeInfo(&out_writer_alloc.writer, parsed_header, frame_infos);
+    out = out_writer_alloc.toArrayList();
 
     try std.testing.expectEqualStrings(
         "Header:\n" ++
@@ -771,25 +775,26 @@ test "cli info output notes disabled frame metadata" {
         .frame_count = 1,
     };
 
-    var writer = buffer.writer(std.testing.allocator);
-    try qov.writeHeader(&writer, header);
-    try qov.writeChunkHeader(&writer, .{
+    var writer_alloc: std.Io.Writer.Allocating = .fromArrayList(std.testing.allocator, &buffer);
+    try qov.writeHeader(&writer_alloc.writer, header);
+    try qov.writeChunkHeader(&writer_alloc.writer, .{
         .chunk_type = .iframe,
         .payload_size = 2,
         .frame_duration_us = 0,
     }, false);
-    try writer.writeAll(&[_]u8{ 0x01, 0x02 });
+    try writer_alloc.writer.writeAll(&[_]u8{ 0x01, 0x02 });
+    buffer = writer_alloc.toArrayList();
 
-    var stream = std.io.fixedBufferStream(buffer.items);
-    var stream_reader = stream.reader();
+    var stream_reader: std.Io.Reader = .fixed(buffer.items);
     const parsed_header = try qov.readHeader(&stream_reader);
     const frame_infos = try collectFrameMetadata(std.testing.allocator, &stream_reader, parsed_header);
     defer std.testing.allocator.free(frame_infos);
 
     var out = std.ArrayList(u8).empty;
     defer out.deinit(std.testing.allocator);
-    var out_writer = out.writer(std.testing.allocator);
-    try writeInfo(&out_writer, parsed_header, frame_infos);
+    var out_writer_alloc: std.Io.Writer.Allocating = .fromArrayList(std.testing.allocator, &out);
+    try writeInfo(&out_writer_alloc.writer, parsed_header, frame_infos);
+    out = out_writer_alloc.toArrayList();
 
     try std.testing.expectEqualStrings(
         "Header:\n" ++

@@ -9,12 +9,15 @@ const ConverterError = error{
     EncodeFailed,
 };
 
-pub fn main() void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) void {
+    const allocator = init.gpa;
+    const io = init.io;
+    const args = init.minimal.args.toSlice(init.arena.allocator()) catch |err| {
+        printStderr("error: {s}\n", .{@errorName(err)}) catch {};
+        std.process.exit(1);
+    };
 
-    runMain(allocator) catch |err| {
+    runMain(allocator, io, args) catch |err| {
         if (err == ConverterError.InvalidArgs) {
             std.process.exit(1);
         }
@@ -23,10 +26,7 @@ pub fn main() void {
     };
 }
 
-fn runMain(allocator: std.mem.Allocator) !void {
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
-
+fn runMain(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     if (args.len != 3) {
         try printUsage();
         return ConverterError.InvalidArgs;
@@ -37,7 +37,7 @@ fn runMain(allocator: std.mem.Allocator) !void {
 
     try printStderr("mpeg2qov: {s} -> {s}\n", .{ input_path, output_path });
 
-    try convert(allocator, input_path, output_path);
+    try convert(allocator, io, input_path, output_path);
 }
 
 fn printUsage() !void {
@@ -51,15 +51,12 @@ fn printUsage() !void {
 }
 
 fn printStderr(comptime fmt: []const u8, args: anytype) !void {
-    var buf: [512]u8 = undefined;
-    var stderr = std.fs.File.stderr().writer(&buf);
-    defer stderr.interface.flush() catch {};
-    try stderr.interface.print(fmt, args);
+    std.debug.print(fmt, args);
 }
 
-fn convert(allocator: std.mem.Allocator, input_path: []const u8, output_path: []const u8) !void {
+fn convert(allocator: std.mem.Allocator, io: std.Io, input_path: []const u8, output_path: []const u8) !void {
     // Open MPEG file
-    const mpeg = try zmpeg.createFromFile(allocator, input_path);
+    const mpeg = try zmpeg.createFromFile(allocator, io, input_path);
     defer mpeg.deinit();
 
     const width: u32 = @intCast(mpeg.getWidth());
@@ -246,11 +243,11 @@ fn convert(allocator: std.mem.Allocator, input_path: []const u8, output_path: []
     };
 
     // Write output
-    var out_file = try std.fs.cwd().createFile(output_path, .{ .truncate = true });
-    defer out_file.close();
+    var out_file = try std.Io.Dir.cwd().createFile(io, output_path, .{ .truncate = true });
+    defer out_file.close(io);
 
     var out_buf: [65536]u8 = undefined;
-    var out_writer = out_file.writer(&out_buf);
+    var out_writer = out_file.writer(io, &out_buf);
 
     // Convert frames list to slice of const slices
     var frame_slices = try allocator.alloc([]const u8, frames.items.len);

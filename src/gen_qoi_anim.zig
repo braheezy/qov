@@ -10,20 +10,17 @@ const QoiHeader = struct {
     colorspace: u8,
 };
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     const output_dir = if (args.len > 1) args[1] else "testdata/qoi_anim";
     const frame_count: usize = if (args.len > 2) try std.fmt.parseInt(usize, args[2], 10) else 48;
     const width: usize = if (args.len > 3) try std.fmt.parseInt(usize, args[3], 10) else 96;
     const height: usize = if (args.len > 4) try std.fmt.parseInt(usize, args[4], 10) else 64;
 
-    try std.fs.cwd().makePath(output_dir);
+    try std.Io.Dir.cwd().createDirPath(io, output_dir);
 
     const pixel_bytes = width * height * 4;
     const pixels = try allocator.alloc(u8, pixel_bytes);
@@ -41,11 +38,11 @@ pub fn main() !void {
         );
         defer allocator.free(filename);
 
-        var file = try std.fs.cwd().createFile(filename, .{ .truncate = true });
-        defer file.close();
+        var file = try std.Io.Dir.cwd().createFile(io, filename, .{ .truncate = true });
+        defer file.close(io);
 
         var buf: [8192]u8 = undefined;
-        var writer = file.writer(&buf);
+        var writer = file.writer(io, &buf);
         try writeQoi(&writer.interface, @intCast(width), @intCast(height), pixels);
         try writer.interface.flush();
     }

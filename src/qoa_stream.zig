@@ -191,14 +191,11 @@ pub const FrameDecoder = struct {
 };
 
 test "parse frame header from arcade.qoa" {
-    var file = try std.fs.cwd().openFile("arcade.qoa", .{});
-    defer file.close();
+    const file_bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "arcade.qoa", std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(file_bytes);
+    try std.testing.expect(file_bytes.len >= 16);
 
-    var header_buf: [16]u8 = undefined;
-    const read_len = try file.readAll(&header_buf);
-    try std.testing.expectEqual(@as(usize, 16), read_len);
-
-    const header = try parseFrameHeader(header_buf[8..16]);
+    const header = try parseFrameHeader(file_bytes[8..16]);
     try std.testing.expectEqual(@as(u8, 2), header.channels);
     try std.testing.expectEqual(@as(u32, 24000), header.sample_rate);
     try std.testing.expectEqual(@as(u16, 5120), header.frame_length);
@@ -206,24 +203,18 @@ test "parse frame header from arcade.qoa" {
 }
 
 test "decode first frame to s16 and f32" {
-    var file = try std.fs.cwd().openFile("arcade.qoa", .{});
-    defer file.close();
+    const file_bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "arcade.qoa", std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(file_bytes);
+    try std.testing.expect(file_bytes.len >= 16);
 
-    var file_header: [8]u8 = undefined;
-    var frame_header: [8]u8 = undefined;
-    _ = try file.readAll(&file_header);
-    const frame_header_len = try file.readAll(&frame_header);
-    try std.testing.expectEqual(@as(usize, 8), frame_header_len);
-
-    const header = try parseFrameHeader(frame_header[0..]);
+    const header = try parseFrameHeader(file_bytes[8..16]);
     const frame_size = @as(usize, header.frame_size);
     var frame_buf = try std.testing.allocator.alloc(u8, frame_size);
     defer std.testing.allocator.free(frame_buf);
 
-    std.mem.copyForwards(u8, frame_buf[0..8], frame_header[0..]);
+    std.mem.copyForwards(u8, frame_buf[0..8], file_bytes[8..16]);
     const payload_len = frame_size - 8;
-    const payload_read = try file.readAll(frame_buf[8..frame_size]);
-    try std.testing.expectEqual(payload_len, payload_read);
+    @memcpy(frame_buf[8..frame_size], file_bytes[16..][0..payload_len]);
 
     var decoder = FrameDecoder.init(header.channels, header.sample_rate);
     const total_samples = header.totalSamples();

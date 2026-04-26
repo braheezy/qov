@@ -4,7 +4,7 @@
 /// const std = @import("std");
 /// const qov = @import("qov");
 ///
-/// var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+/// var gpa = std.heap.DebugAllocator(.{}){};
 /// defer _ = gpa.deinit();
 /// const allocator = gpa.allocator();
 ///
@@ -31,8 +31,7 @@
 /// var writer = encoded.writer(allocator);
 /// try qov.encodeStream(allocator, &writer, header, &frames, null);
 ///
-/// var stream = std.io.fixedBufferStream(encoded.items);
-/// var reader = stream.reader();
+/// var reader: std.Io.Reader = .fixed(encoded.items);
 /// var out_frame: [4]u8 = undefined;
 /// var out_frames = [_][]u8{ &out_frame };
 /// _ = try qov.decodeStream(allocator, &reader, &out_frames);
@@ -261,7 +260,10 @@ fn readExact(reader: anytype, buf: []u8) (QovError || readerErrorType(@TypeOf(re
         else => @TypeOf(reader),
     };
     if (@hasDecl(ReaderT, "readSliceAll")) {
-        try reader.readSliceAll(buf);
+        reader.readSliceAll(buf) catch |err| switch (err) {
+            error.EndOfStream => return QovError.UnexpectedEof,
+            else => |e| return e,
+        };
         return;
     }
     if (@hasDecl(ReaderT, "readAll")) {
@@ -462,8 +464,7 @@ fn encodeFrameJob(ctx: *EncodeJobContext, index: usize) void {
     if (ctx.has_error.load(.seq_cst)) return;
 
     const use_iframe = ctx.use_iframes[index];
-    var stream = std.io.fixedBufferStream(ctx.payload_buffers[index]);
-    var stream_writer = stream.writer();
+    var stream_writer: std.Io.Writer = .fixed(ctx.payload_buffers[index]);
 
     if (ctx.rgb_only) {
         const rgba_frames = ctx.rgba_frames orelse {
@@ -515,7 +516,7 @@ fn encodeFrameJob(ctx: *EncodeJobContext, index: usize) void {
         }
     }
 
-    ctx.payload_sizes[index] = stream.pos;
+    ctx.payload_sizes[index] = stream_writer.end;
 }
 
 const AudioChunkState = struct {
@@ -564,13 +565,13 @@ fn encodeStreamSequential(allocator: std.mem.Allocator, writer: anytype, header:
         if (rgba_b) |buffer| allocator.free(buffer);
     }
 
-    const gop_size = header.gop_size;
     const has_frame_metadata = header.flags.frame_metadata;
 
     for (frames, 0..) |frame, index| {
         payload.clearRetainingCapacity();
+        var payload_writer_alloc: std.Io.Writer.Allocating = .fromArrayList(allocator, &payload);
 
-        const use_iframe = index == 0 or gop_size == 0 or (index % gop_size == 0);
+        const use_iframe = index == 0 or header.gop_size == 0 or (index % header.gop_size == 0);
         const frame_duration_us: u32 = if (has_frame_metadata) blk: {
             if (frame_durations_us) |durations| {
                 break :blk durations[index];
@@ -583,26 +584,23 @@ fn encodeStreamSequential(allocator: std.mem.Allocator, writer: anytype, header:
             const prev = rgba_prev orelse return QovError.InvalidChunk;
             expandRgbToRgba(curr, frame);
             if (use_iframe) {
-                var payload_writer = payload.writer(allocator);
-                try encodeIFrame(&payload_writer, curr);
+                try encodeIFrame(&payload_writer_alloc.writer, curr);
             } else {
-                var payload_writer = payload.writer(allocator);
-                try encodePFrame(&payload_writer, curr, prev);
+                try encodePFrame(&payload_writer_alloc.writer, curr, prev);
             }
             rgba_curr = prev;
             rgba_prev = curr;
             prev_pixels = rgba_prev;
         } else {
             if (use_iframe) {
-                var payload_writer = payload.writer(allocator);
-                try encodeIFrame(&payload_writer, frame);
+                try encodeIFrame(&payload_writer_alloc.writer, frame);
             } else {
                 const prev = prev_pixels orelse return QovError.InvalidChunk;
-                var payload_writer = payload.writer(allocator);
-                try encodePFrame(&payload_writer, frame, prev);
+                try encodePFrame(&payload_writer_alloc.writer, frame, prev);
             }
             prev_pixels = frame;
         }
+        payload = payload_writer_alloc.toArrayList();
 
         if (payload.items.len > std.math.maxInt(u32)) return QovError.InvalidChunk;
 
@@ -651,7 +649,6 @@ pub fn encodeStreamWithOptions(allocator: std.mem.Allocator, writer: anytype, he
 
     try writeHeader(writer, header);
 
-    const gop_size = header.gop_size;
     const has_frame_metadata = header.flags.frame_metadata;
     const default_frame_duration_us: u32 = if (has_frame_metadata and frame_durations_us == null) blk: {
         const duration = @as(u64, header.fps_den) * 1_000_000 / @as(u64, header.fps_num);
@@ -662,114 +659,9 @@ pub fn encodeStreamWithOptions(allocator: std.mem.Allocator, writer: anytype, he
     var audio_state_storage: ?AudioChunkState = if (options.audio_chunks) |audio_chunks| .{ .chunks = audio_chunks } else null;
     const audio_state: ?*AudioChunkState = if (audio_state_storage) |*state| state else null;
 
-    if (options.parallel and frames.len > 1 and !builtin.single_threaded) {
-        var pool: std.Thread.Pool = undefined;
-        if (pool.init(.{ .allocator = allocator, .n_jobs = options.max_threads })) |_| {
-            defer pool.deinit();
-
-        const frame_count = frames.len;
-        const rgb_only = header.flags.rgb_only;
-        const payload_capacity = maxFramePayloadBytes(header);
-
-        var payload_buffers = try allocator.alloc([]u8, frame_count);
-        errdefer allocator.free(payload_buffers);
-        var payload_sizes = try allocator.alloc(usize, frame_count);
-        errdefer allocator.free(payload_sizes);
-
-        var payload_init: usize = 0;
-        errdefer {
-            for (payload_buffers[0..payload_init]) |payload| allocator.free(payload);
-        }
-        for (payload_buffers, 0..) |*payload, index| {
-            payload.* = try allocator.alloc(u8, payload_capacity);
-            payload_sizes[index] = 0;
-            payload_init += 1;
-        }
-        defer {
-            for (payload_buffers) |payload| allocator.free(payload);
-            allocator.free(payload_buffers);
-            allocator.free(payload_sizes);
-        }
-        payload_init = 0;
-
-        var rgba_frames: ?[][]u8 = null;
-        if (rgb_only) {
-            const rgba_bytes = headerFramePixels(header) * 4;
-            var buffers = try allocator.alloc([]u8, frame_count);
-            errdefer allocator.free(buffers);
-            var rgba_init: usize = 0;
-            errdefer {
-                for (buffers[0..rgba_init]) |buffer| allocator.free(buffer);
-            }
-            for (buffers, 0..) |*buffer, index| {
-                buffer.* = try allocator.alloc(u8, rgba_bytes);
-                expandRgbToRgba(buffer.*, frames[index]);
-                rgba_init += 1;
-            }
-            rgba_frames = buffers;
-            rgba_init = 0;
-        }
-        defer if (rgba_frames) |buffers| {
-            for (buffers) |buffer| allocator.free(buffer);
-            allocator.free(buffers);
-        };
-
-        const use_iframes = try allocator.alloc(bool, frame_count);
-        defer allocator.free(use_iframes);
-        for (use_iframes, 0..) |*use_iframe, index| {
-            use_iframe.* = index == 0 or gop_size == 0 or (index % gop_size == 0);
-        }
-
-        var wg: std.Thread.WaitGroup = .{};
-        var has_error = std.atomic.Value(bool).init(false);
-        var err_mutex = std.Thread.Mutex{};
-        var stored_err: ?QovError = null;
-
-        var ctx = EncodeJobContext{
-            .frames = frames,
-            .rgba_frames = rgba_frames,
-            .use_iframes = use_iframes,
-            .payload_buffers = payload_buffers,
-            .payload_sizes = payload_sizes,
-            .has_error = &has_error,
-            .err_mutex = &err_mutex,
-            .stored_err = &stored_err,
-            .rgb_only = rgb_only,
-        };
-
-        for (0..frame_count) |index| {
-            pool.spawnWg(&wg, encodeFrameJob, .{ &ctx, index });
-        }
-        pool.waitAndWork(&wg);
-
-        if (stored_err) |err| return err;
-
-        for (0..frame_count) |index| {
-            const use_iframe = use_iframes[index];
-            const frame_duration_us: u32 = if (has_frame_metadata) blk: {
-                if (frame_durations_us) |durations| {
-                    break :blk durations[index];
-                }
-                break :blk default_frame_duration_us;
-            } else 0;
-            const payload_size = payload_sizes[index];
-            if (payload_size > std.math.maxInt(u32)) return QovError.InvalidChunk;
-
-            try writeChunkHeader(writer, .{
-                .chunk_type = if (use_iframe) .iframe else .pframe,
-                .payload_size = @intCast(payload_size),
-                .frame_duration_us = frame_duration_us,
-            }, has_frame_metadata);
-            try writeChunkPayload(writer, payload_buffers[index][0..payload_size]);
-            try writeNextAudioChunk(writer, header, audio_state);
-        }
-        try writeRemainingAudioChunks(writer, header, audio_state);
-        } else |_| {
-            try encodeStreamSequential(allocator, writer, header, frames, frame_durations_us, default_frame_duration_us, audio_state);
-        }
-    } else {
-        try encodeStreamSequential(allocator, writer, header, frames, frame_durations_us, default_frame_duration_us, audio_state);
-    }
+    _ = options.parallel;
+    _ = options.max_threads;
+    try encodeStreamSequential(allocator, writer, header, frames, frame_durations_us, default_frame_duration_us, audio_state);
 }
 
 /// Streaming decoder that reads headers once and advances frame-by-frame.
@@ -860,8 +752,7 @@ pub fn StreamDecoder(comptime ReaderType: type) type {
 
                     self.last_frame_duration_us = chunk_header.frame_duration_us;
 
-                    var stream = std.io.fixedBufferStream(self.payload.items);
-                    var stream_reader = stream.reader();
+                    var stream_reader: std.Io.Reader = .fixed(self.payload.items);
 
                     switch (chunk_header.chunk_type) {
                         .iframe => {
@@ -891,7 +782,7 @@ pub fn StreamDecoder(comptime ReaderType: type) type {
                         else => return QovError.InvalidChunk,
                     }
 
-                    if (stream.pos != self.payload.items.len) return QovError.InvalidChunk;
+                    if (stream_reader.seek != self.payload.items.len) return QovError.InvalidChunk;
 
                     self.frame_index += 1;
                     return StreamPacket{ .frame = {} };
@@ -1394,6 +1285,14 @@ fn hasPrefix(value: u8, comptime T: type, prefix: T) bool {
     return (@as(T, @truncate(value >> (8 - @bitSizeOf(T)))) == prefix);
 }
 
+fn testArrayListWriter(list: *std.ArrayList(u8)) std.Io.Writer.Allocating {
+    return .fromArrayList(std.testing.allocator, list);
+}
+
+fn finishTestArrayListWriter(list: *std.ArrayList(u8), writer: *std.Io.Writer.Allocating) void {
+    list.* = writer.toArrayList();
+}
+
 test "header validation for RGBA-only frames" {
     const header = Header{
         .width = 2,
@@ -1452,12 +1351,10 @@ test "header read/write roundtrip" {
     };
 
     var buffer: [header_size]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buffer);
-    var stream_writer = stream.writer();
+    var stream_writer: std.Io.Writer = .fixed(&buffer);
     try writeHeader(&stream_writer, header);
 
-    stream.pos = 0;
-    const stream_reader = stream.reader();
+    var stream_reader: std.Io.Reader = .fixed(stream_writer.buffered());
     const decoded = try readHeader(&stream_reader);
 
     try std.testing.expectEqual(header.width, decoded.width);
@@ -1484,13 +1381,11 @@ test "chunk header and payload read/write roundtrip" {
 
     const header_len: usize = chunk_header_size;
     var buffer: [header_len + payload.len]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buffer);
-    var stream_writer = stream.writer();
+    var stream_writer: std.Io.Writer = .fixed(&buffer);
     try writeChunkHeader(&stream_writer, header, false);
     try writeChunkPayload(&stream_writer, payload);
 
-    stream.pos = 0;
-    const stream_reader = stream.reader();
+    var stream_reader: std.Io.Reader = .fixed(stream_writer.buffered());
     const decoded_header = try readChunkHeader(&stream_reader, false);
 
     var decoded_payload: [payload.len]u8 = undefined;
@@ -1511,13 +1406,11 @@ test "chunk header and payload read/write roundtrip with metadata" {
 
     const header_len: usize = chunk_header_metadata_size;
     var buffer: [header_len + payload.len]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buffer);
-    var stream_writer = stream.writer();
+    var stream_writer: std.Io.Writer = .fixed(&buffer);
     try writeChunkHeader(&stream_writer, header, true);
     try writeChunkPayload(&stream_writer, payload);
 
-    stream.pos = 0;
-    var stream_reader = stream.reader();
+    var stream_reader: std.Io.Reader = .fixed(stream_writer.buffered());
     const decoded_header = try readChunkHeader(&stream_reader, true);
 
     var decoded_payload: [payload.len]u8 = undefined;
@@ -1541,16 +1434,16 @@ test "I-frame encode/decode roundtrip" {
     var encoded = std.ArrayList(u8).empty;
     defer encoded.deinit(std.testing.allocator);
 
-    var encoded_writer = encoded.writer(std.testing.allocator);
-    try encodeIFrame(&encoded_writer, &pixels);
+    var encoded_writer_alloc = testArrayListWriter(&encoded);
+    try encodeIFrame(&encoded_writer_alloc.writer, &pixels);
+    finishTestArrayListWriter(&encoded, &encoded_writer_alloc);
 
     var decoded: [pixels.len]u8 = undefined;
-    var stream = std.io.fixedBufferStream(encoded.items);
-    var stream_reader = stream.reader();
+    var stream_reader: std.Io.Reader = .fixed(encoded.items);
     try decodeIFrame(&stream_reader, &decoded);
 
     try std.testing.expectEqualSlices(u8, &pixels, &decoded);
-    try std.testing.expectEqual(encoded.items.len, stream.pos);
+    try std.testing.expectEqual(encoded.items.len, stream_reader.seek);
 }
 
 test "P-frame encode/decode roundtrip with temporal ops" {
@@ -1571,16 +1464,16 @@ test "P-frame encode/decode roundtrip with temporal ops" {
     var encoded = std.ArrayList(u8).empty;
     defer encoded.deinit(std.testing.allocator);
 
-    var encoded_writer = encoded.writer(std.testing.allocator);
-    try encodePFrame(&encoded_writer, &pixels, &prev_pixels);
+    var encoded_writer_alloc = testArrayListWriter(&encoded);
+    try encodePFrame(&encoded_writer_alloc.writer, &pixels, &prev_pixels);
+    finishTestArrayListWriter(&encoded, &encoded_writer_alloc);
 
     var decoded: [pixels.len]u8 = undefined;
-    var stream = std.io.fixedBufferStream(encoded.items);
-    var stream_reader = stream.reader();
+    var stream_reader: std.Io.Reader = .fixed(encoded.items);
     try decodePFrame(&stream_reader, &decoded, &prev_pixels);
 
     try std.testing.expectEqualSlices(u8, &pixels, &decoded);
-    try std.testing.expectEqual(encoded.items.len, stream.pos);
+    try std.testing.expectEqual(encoded.items.len, stream_reader.seek);
     try std.testing.expect(std.mem.indexOfScalar(u8, encoded.items, 0xFC) != null);
     try std.testing.expect(std.mem.indexOfScalar(u8, encoded.items, 0xFD) != null);
 }
@@ -1620,15 +1513,15 @@ test "stream encode/decode roundtrip" {
     var encoded = std.ArrayList(u8).empty;
     defer encoded.deinit(std.testing.allocator);
 
-    var encoded_writer = encoded.writer(std.testing.allocator);
-    try encodeStream(std.testing.allocator, &encoded_writer, header, &frames, null);
+    var encoded_writer_alloc = testArrayListWriter(&encoded);
+    try encodeStream(std.testing.allocator, &encoded_writer_alloc.writer, header, &frames, null);
+    finishTestArrayListWriter(&encoded, &encoded_writer_alloc);
 
     var out0: [frame0.len]u8 = undefined;
     var out1: [frame1.len]u8 = undefined;
     var out_frames = [_][]u8{ &out0, &out1 };
 
-    var stream = std.io.fixedBufferStream(encoded.items);
-    var stream_reader = stream.reader();
+    var stream_reader: std.Io.Reader = .fixed(encoded.items);
     const decoded_header = try decodeStream(std.testing.allocator, &stream_reader, &out_frames);
 
     try std.testing.expectEqual(header.width, decoded_header.width);
@@ -1636,7 +1529,7 @@ test "stream encode/decode roundtrip" {
     try std.testing.expectEqual(header.frame_count, decoded_header.frame_count);
     try std.testing.expectEqualSlices(u8, &frame0, out_frames[0]);
     try std.testing.expectEqualSlices(u8, &frame1, out_frames[1]);
-    try std.testing.expectEqual(encoded.items.len, stream.pos);
+    try std.testing.expectEqual(encoded.items.len, stream_reader.seek);
 }
 
 test "stream encode/decode roundtrip parallel" {
@@ -1674,15 +1567,15 @@ test "stream encode/decode roundtrip parallel" {
     var encoded = std.ArrayList(u8).empty;
     defer encoded.deinit(std.testing.allocator);
 
-    var encoded_writer = encoded.writer(std.testing.allocator);
-    try encodeStreamWithOptions(std.testing.allocator, &encoded_writer, header, &frames, null, .{ .parallel = true });
+    var encoded_writer_alloc = testArrayListWriter(&encoded);
+    try encodeStreamWithOptions(std.testing.allocator, &encoded_writer_alloc.writer, header, &frames, null, .{ .parallel = true });
+    finishTestArrayListWriter(&encoded, &encoded_writer_alloc);
 
     var out0: [frame0.len]u8 = undefined;
     var out1: [frame1.len]u8 = undefined;
     var out_frames = [_][]u8{ &out0, &out1 };
 
-    var stream = std.io.fixedBufferStream(encoded.items);
-    var stream_reader = stream.reader();
+    var stream_reader: std.Io.Reader = .fixed(encoded.items);
     const decoded_header = try decodeStream(std.testing.allocator, &stream_reader, &out_frames);
 
     try std.testing.expectEqual(header.width, decoded_header.width);
@@ -1690,28 +1583,22 @@ test "stream encode/decode roundtrip parallel" {
     try std.testing.expectEqual(header.frame_count, decoded_header.frame_count);
     try std.testing.expectEqualSlices(u8, &frame0, out_frames[0]);
     try std.testing.expectEqualSlices(u8, &frame1, out_frames[1]);
-    try std.testing.expectEqual(encoded.items.len, stream.pos);
+    try std.testing.expectEqual(encoded.items.len, stream_reader.seek);
 }
 
 test "stream encode interleaves audio chunks" {
-    var file = try std.fs.cwd().openFile("arcade.qoa", .{});
-    defer file.close();
+    const qoa_bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "arcade.qoa", std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(qoa_bytes);
+    try std.testing.expect(qoa_bytes.len >= 16);
+    const frame_header_bytes = qoa_bytes[8..16];
 
-    var file_header: [8]u8 = undefined;
-    _ = try file.readAll(&file_header);
-
-    var frame_header_bytes: [8]u8 = undefined;
-    const header_len = try file.readAll(&frame_header_bytes);
-    try std.testing.expectEqual(@as(usize, 8), header_len);
-
-    const frame_header = try qoa_stream.parseFrameHeader(&frame_header_bytes);
+    const frame_header = try qoa_stream.parseFrameHeader(frame_header_bytes);
     const frame_size: usize = @intCast(frame_header.frame_size);
     var frame_payload = try std.testing.allocator.alloc(u8, frame_size);
     defer std.testing.allocator.free(frame_payload);
 
-    std.mem.copyForwards(u8, frame_payload[0..8], &frame_header_bytes);
-    const payload_read = try file.readAll(frame_payload[8..frame_size]);
-    try std.testing.expectEqual(frame_size - 8, payload_read);
+    std.mem.copyForwards(u8, frame_payload[0..8], frame_header_bytes);
+    @memcpy(frame_payload[8..frame_size], qoa_bytes[16..][0 .. frame_size - 8]);
 
     const header = Header{
         .width = 1,
@@ -1737,11 +1624,11 @@ test "stream encode interleaves audio chunks" {
     var encoded = std.ArrayList(u8).empty;
     defer encoded.deinit(std.testing.allocator);
 
-    var encoded_writer = encoded.writer(std.testing.allocator);
-    try encodeStreamWithOptions(std.testing.allocator, &encoded_writer, header, &frames, null, .{ .audio_chunks = &audio_chunks });
+    var encoded_writer_alloc = testArrayListWriter(&encoded);
+    try encodeStreamWithOptions(std.testing.allocator, &encoded_writer_alloc.writer, header, &frames, null, .{ .audio_chunks = &audio_chunks });
+    finishTestArrayListWriter(&encoded, &encoded_writer_alloc);
 
-    var stream = std.io.fixedBufferStream(encoded.items);
-    var stream_reader = stream.reader();
+    var stream_reader: std.Io.Reader = .fixed(encoded.items);
     const decoded_header = try readHeader(&stream_reader);
     try std.testing.expect(decoded_header.has_audio);
 
@@ -1760,28 +1647,22 @@ test "stream encode interleaves audio chunks" {
         }
     }
 
-    try std.testing.expectEqual(encoded.items.len, stream.pos);
+    try std.testing.expectEqual(encoded.items.len, stream_reader.seek);
 }
 
 test "stream decoder exposes audio packets" {
-    var file = try std.fs.cwd().openFile("arcade.qoa", .{});
-    defer file.close();
+    const qoa_bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "arcade.qoa", std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(qoa_bytes);
+    try std.testing.expect(qoa_bytes.len >= 16);
+    const frame_header_bytes = qoa_bytes[8..16];
 
-    var file_header: [8]u8 = undefined;
-    _ = try file.readAll(&file_header);
-
-    var frame_header_bytes: [8]u8 = undefined;
-    const header_len = try file.readAll(&frame_header_bytes);
-    try std.testing.expectEqual(@as(usize, 8), header_len);
-
-    const frame_header = try qoa_stream.parseFrameHeader(&frame_header_bytes);
+    const frame_header = try qoa_stream.parseFrameHeader(frame_header_bytes);
     const frame_size: usize = @intCast(frame_header.frame_size);
     var frame_payload = try std.testing.allocator.alloc(u8, frame_size);
     defer std.testing.allocator.free(frame_payload);
 
-    std.mem.copyForwards(u8, frame_payload[0..8], &frame_header_bytes);
-    const payload_read = try file.readAll(frame_payload[8..frame_size]);
-    try std.testing.expectEqual(frame_size - 8, payload_read);
+    std.mem.copyForwards(u8, frame_payload[0..8], frame_header_bytes);
+    @memcpy(frame_payload[8..frame_size], qoa_bytes[16..][0 .. frame_size - 8]);
 
     const header = Header{
         .width = 1,
@@ -1807,11 +1688,11 @@ test "stream decoder exposes audio packets" {
     var encoded = std.ArrayList(u8).empty;
     defer encoded.deinit(std.testing.allocator);
 
-    var encoded_writer = encoded.writer(std.testing.allocator);
-    try encodeStreamWithOptions(std.testing.allocator, &encoded_writer, header, &frames, null, .{ .audio_chunks = &audio_chunks });
+    var encoded_writer_alloc = testArrayListWriter(&encoded);
+    try encodeStreamWithOptions(std.testing.allocator, &encoded_writer_alloc.writer, header, &frames, null, .{ .audio_chunks = &audio_chunks });
+    finishTestArrayListWriter(&encoded, &encoded_writer_alloc);
 
-    var stream = std.io.fixedBufferStream(encoded.items);
-    var stream_reader = stream.reader();
+    var stream_reader: std.Io.Reader = .fixed(encoded.items);
     var decoder = try StreamDecoder(@TypeOf(&stream_reader)).init(std.testing.allocator, &stream_reader);
     defer decoder.deinit();
 
@@ -1837,7 +1718,7 @@ test "stream decoder exposes audio packets" {
 
     try std.testing.expectEqual(@as(usize, 2), frame_index);
     try std.testing.expectEqual(@as(usize, 3), audio_count);
-    try std.testing.expectEqual(encoded.items.len, stream.pos);
+    try std.testing.expectEqual(encoded.items.len, stream_reader.seek);
 }
 
 test "stream decoder exposes frame duration metadata" {
@@ -1877,11 +1758,11 @@ test "stream decoder exposes frame duration metadata" {
     var encoded = std.ArrayList(u8).empty;
     defer encoded.deinit(std.testing.allocator);
 
-    var encoded_writer = encoded.writer(std.testing.allocator);
-    try encodeStream(std.testing.allocator, &encoded_writer, header, &frames, &durations);
+    var encoded_writer_alloc = testArrayListWriter(&encoded);
+    try encodeStream(std.testing.allocator, &encoded_writer_alloc.writer, header, &frames, &durations);
+    finishTestArrayListWriter(&encoded, &encoded_writer_alloc);
 
-    var stream = std.io.fixedBufferStream(encoded.items);
-    var stream_reader = stream.reader();
+    var stream_reader: std.Io.Reader = .fixed(encoded.items);
     var decoder = try StreamDecoder(@TypeOf(&stream_reader)).init(std.testing.allocator, &stream_reader);
     defer decoder.deinit();
 
@@ -1926,15 +1807,15 @@ test "stream encode/decode roundtrip RGB-only" {
     var encoded = std.ArrayList(u8).empty;
     defer encoded.deinit(std.testing.allocator);
 
-    var encoded_writer = encoded.writer(std.testing.allocator);
-    try encodeStream(std.testing.allocator, &encoded_writer, header, &frames, null);
+    var encoded_writer_alloc = testArrayListWriter(&encoded);
+    try encodeStream(std.testing.allocator, &encoded_writer_alloc.writer, header, &frames, null);
+    finishTestArrayListWriter(&encoded, &encoded_writer_alloc);
 
     var out0: [frame0.len]u8 = undefined;
     var out1: [frame1.len]u8 = undefined;
     var out_frames = [_][]u8{ &out0, &out1 };
 
-    var stream = std.io.fixedBufferStream(encoded.items);
-    var stream_reader = stream.reader();
+    var stream_reader: std.Io.Reader = .fixed(encoded.items);
     const decoded_header = try decodeStream(std.testing.allocator, &stream_reader, &out_frames);
 
     try std.testing.expectEqual(header.width, decoded_header.width);
@@ -1942,7 +1823,7 @@ test "stream encode/decode roundtrip RGB-only" {
     try std.testing.expectEqual(header.frame_count, decoded_header.frame_count);
     try std.testing.expectEqualSlices(u8, &frame0, out_frames[0]);
     try std.testing.expectEqualSlices(u8, &frame1, out_frames[1]);
-    try std.testing.expectEqual(encoded.items.len, stream.pos);
+    try std.testing.expectEqual(encoded.items.len, stream_reader.seek);
 }
 
 test "stream rejects frame size mismatches" {
@@ -1979,16 +1860,14 @@ test "stream rejects frame size mismatches" {
     var encoded = std.ArrayList(u8).empty;
     defer encoded.deinit(std.testing.allocator);
 
-    var encoded_writer = encoded.writer(std.testing.allocator);
-    try std.testing.expectError(QovError.FrameSizeMismatch, encodeStream(std.testing.allocator, &encoded_writer, header, &frames, null));
+    var encoded_writer_alloc = testArrayListWriter(&encoded);
+    try std.testing.expectError(QovError.FrameSizeMismatch, encodeStream(std.testing.allocator, &encoded_writer_alloc.writer, header, &frames, null));
 
     var buffer: [header_size]u8 = undefined;
-    var header_stream = std.io.fixedBufferStream(&buffer);
-    var header_writer = header_stream.writer();
+    var header_writer: std.Io.Writer = .fixed(&buffer);
     try writeHeader(&header_writer, header);
 
-    header_stream.pos = 0;
-    var header_reader = header_stream.reader();
+    var header_reader: std.Io.Reader = .fixed(header_writer.buffered());
     var decoder = try StreamDecoder(@TypeOf(&header_reader)).init(std.testing.allocator, &header_reader);
     defer decoder.deinit();
 
@@ -2027,11 +1906,11 @@ test "stream decoder nextFrame helper" {
     var encoded = std.ArrayList(u8).empty;
     defer encoded.deinit(std.testing.allocator);
 
-    var encoded_writer = encoded.writer(std.testing.allocator);
-    try encodeStream(std.testing.allocator, &encoded_writer, header, &frames, null);
+    var encoded_writer_alloc = testArrayListWriter(&encoded);
+    try encodeStream(std.testing.allocator, &encoded_writer_alloc.writer, header, &frames, null);
+    finishTestArrayListWriter(&encoded, &encoded_writer_alloc);
 
-    var stream = std.io.fixedBufferStream(encoded.items);
-    var stream_reader = stream.reader();
+    var stream_reader: std.Io.Reader = .fixed(encoded.items);
     var decoder = try StreamDecoder(@TypeOf(&stream_reader)).init(std.testing.allocator, &stream_reader);
     defer decoder.deinit();
 
@@ -2044,7 +1923,7 @@ test "stream decoder nextFrame helper" {
 
     try std.testing.expectEqualSlices(u8, &frame0, &out0);
     try std.testing.expectEqualSlices(u8, &frame1, &out1);
-    try std.testing.expectEqual(encoded.items.len, stream.pos);
+    try std.testing.expectEqual(encoded.items.len, stream_reader.seek);
 }
 
 test {

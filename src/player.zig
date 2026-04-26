@@ -8,12 +8,15 @@ const PlayerError = error{
     AudioDecodeError,
 };
 
-pub fn main() void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) void {
+    const allocator = init.gpa;
+    const io = init.io;
+    const args = init.minimal.args.toSlice(init.arena.allocator()) catch |err| {
+        printStderr("error: {s}\n", .{@errorName(err)}) catch {};
+        std.process.exit(1);
+    };
 
-    runMain(allocator) catch |err| {
+    runMain(allocator, io, args) catch |err| {
         if (err == PlayerError.InvalidArgs) {
             std.process.exit(1);
         }
@@ -28,10 +31,7 @@ pub fn main() void {
     };
 }
 
-fn runMain(allocator: std.mem.Allocator) !void {
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
-
+fn runMain(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     if (args.len < 2) {
         try printUsage();
         return PlayerError.InvalidArgs;
@@ -56,7 +56,7 @@ fn runMain(allocator: std.mem.Allocator) !void {
         try printUsage();
         return PlayerError.InvalidArgs;
     };
-    try runPlayer(allocator, path, loop);
+    try runPlayer(allocator, io, path, loop);
 }
 
 fn printUsage() !void {
@@ -68,18 +68,14 @@ fn printUsage() !void {
 }
 
 fn printStderr(comptime fmt: []const u8, args: anytype) !void {
-    var stderr_buf: [512]u8 = undefined;
-    var err = std.fs.File.stderr().writer(&stderr_buf);
-    defer err.interface.flush() catch {};
-    try err.interface.print(fmt, args);
+    std.debug.print(fmt, args);
 }
 
-fn runPlayer(allocator: std.mem.Allocator, input_path: []const u8, loop: bool) !void {
-    const file_bytes = try std.fs.cwd().readFileAlloc(allocator, input_path, std.math.maxInt(usize));
+fn runPlayer(allocator: std.mem.Allocator, io: std.Io, input_path: []const u8, loop: bool) !void {
+    const file_bytes = try std.Io.Dir.cwd().readFileAlloc(io, input_path, allocator, .unlimited);
     defer allocator.free(file_bytes);
 
-    var stream = std.io.fixedBufferStream(file_bytes);
-    var reader = stream.reader();
+    var reader: std.Io.Reader = .fixed(file_bytes);
     var decoder = try qov.StreamDecoder(@TypeOf(&reader)).init(allocator, &reader);
     defer decoder.deinit();
 
@@ -198,8 +194,7 @@ fn runPlayer(allocator: std.mem.Allocator, input_path: []const u8, loop: bool) !
         }
 
         decoder.deinit();
-        stream.reset();
-        reader = stream.reader();
+        reader = .fixed(file_bytes);
         decoder = try qov.StreamDecoder(@TypeOf(&reader)).init(allocator, &reader);
         if (decoder.header.width != @as(u16, @intCast(width)) or decoder.header.height != @as(u16, @intCast(height))) {
             return PlayerError.InvalidQov;
